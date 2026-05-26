@@ -13,6 +13,7 @@
       <span>Halo<span>Plus</span><span class="plus">+</span></span>
     </a>
     <div class="header-meta">
+      <span class="env-pill" id="envPill" title="Environment label" style="display:none"></span>
       <span class="context-badge" id="contextBadge" title="Active page context">&mdash;</span>
       <button class="header-icon-btn" id="headerThemeBtn" type="button" title="Toggle dark mode" aria-label="Toggle dark mode">
         <svg class="theme-icon theme-icon-moon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -78,6 +79,23 @@
               </svg>
             </button>
             <button class="csd-clear-btn" id="clearTableBtn" type="button" title="Clear" style="display:none">&#x2715;</button>
+            <div class="viewer-saved-section" id="savedQueriesWrap" style="display:none">
+              <div class="sq-control">
+                <button class="sq-trigger" id="sqTriggerBtn" type="button" aria-haspopup="true" aria-expanded="false" title="Saved queries">
+                  <svg class="sq-star" viewBox="0 0 14 14" width="12" height="12" fill="currentColor" aria-hidden="true">
+                    <path d="M7 1l1.8 4.1 4.5.4-3.4 3 1 4.5L7 10.7 3.1 13l1-4.5L.7 5.5l4.5-.4z"/>
+                  </svg>
+                  <span class="sq-trigger-count" id="sqCount"></span>
+                  <svg class="csd-chevron" viewBox="0 0 10 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M1 1l4 4 4-4"/>
+                  </svg>
+                </button>
+                <div class="sq-menu" id="sqMenu" hidden>
+                  <div class="sq-menu-list" id="savedQueriesList"></div>
+                  <button class="sq-menu-save" id="saveQueryBtn" type="button">+ Save current query</button>
+                </div>
+              </div>
+            </div>
           </div>
           <div class="csd-dropdown" id="tablePickerDropdown">
             <div class="csd-search-bar">
@@ -95,6 +113,7 @@
           </div>
         </div>
       </div>
+
     </div>
 
     <section class="record-browser">
@@ -143,6 +162,11 @@
   <section class="tab-content" id="tab-sql-helper" role="tabpanel">
     <div class="search-bar">
       <input type="text" id="schemaSearch" placeholder="Search tables &amp; columns..." autocomplete="off">
+    </div>
+    <div class="schema-perspective" id="schemaPerspective" role="radiogroup" aria-label="Schema perspective">
+      <button type="button" class="schema-perspective-btn" data-mode="both" data-active="true" title="Show both SQL columns and API field names">Both</button>
+      <button type="button" class="schema-perspective-btn" data-mode="sql"  data-active="false" title="SQL columns only — for reports and data lookups">SQL</button>
+      <button type="button" class="schema-perspective-btn" data-mode="api"  data-active="false" title="API field names only — for API integrations">API</button>
     </div>
     <div class="schema-list" id="schemaList"></div>
   </section>
@@ -255,27 +279,16 @@
 
     <section class="helper-content active" id="helper-preferences">
       <div class="settings-stack">
-        <div class="settings-card settings-card-tight">
-          <span class="settings-section-kicker">Domains</span>
-          <h3 class="settings-section-title">Custom Halo domains</h3>
-          <p class="settings-section-copy">Add one custom Halo URL or hostname per line for environments that do not use a standard Halo domain.</p>
-          <div class="domain-settings">
-            <textarea id="customHaloDomains" class="input-field domain-input" rows="3" placeholder="https://support.example.com"></textarea>
-            <div class="domain-actions">
-              <button class="btn-primary" id="saveCustomDomainsBtn" type="button">Save domains</button>
-              <span class="domain-status" id="customDomainStatus" aria-live="polite"></span>
-            </div>
+        <div class="settings-card settings-card-tight pref-card">
+          <div class="pref-card-head">
+            <h3 class="settings-section-title">Ticket 360</h3>
+            <p class="pref-card-copy">Controls the in-page drawer that opens on top of Halo tickets.</p>
           </div>
-        </div>
-
-        <div class="settings-card settings-card-tight">
-          <span class="settings-section-kicker">Ticket 360</span>
-          <h3 class="settings-section-title">Display preferences</h3>
           <div class="pref-list">
-            <label class="pref-row" for="prefTicket360Enabled">
+            <label class="pref-row pref-row-parent" for="prefTicket360Enabled">
               <div class="pref-row-text">
                 <span class="pref-label">Enable Ticket 360</span>
-                <span class="pref-sub">Turn off to hide the Ticket 360 button and stop auto-opening on tickets</span>
+                <span class="pref-sub">Turn off to hide the Ticket 360 button and stop auto-opening on tickets.</span>
               </div>
               <input class="pref-toggle" type="checkbox" id="prefTicket360Enabled">
             </label>
@@ -283,21 +296,21 @@
               <label class="pref-row" for="prefAuto360">
                 <div class="pref-row-text">
                   <span class="pref-label">Auto-open on tickets</span>
-                  <span class="pref-sub">Automatically show Ticket 360 when navigating to a ticket</span>
+                  <span class="pref-sub">Show Ticket 360 automatically when navigating to a ticket.</span>
                 </div>
                 <input class="pref-toggle" type="checkbox" id="prefAuto360">
               </label>
               <label class="pref-row" for="prefDrawer360Push">
                 <div class="pref-row-text">
                   <span class="pref-label">Slide in panel</span>
-                  <span class="pref-sub">Slide the panel in from the right edge and shrink the page content to make room</span>
+                  <span class="pref-sub">Slide the panel in from the right edge and shrink the page content to make room.</span>
                 </div>
                 <input class="pref-toggle" type="checkbox" id="prefDrawer360Push">
               </label>
               <label class="pref-row" for="prefHideHaloSidebar">
                 <div class="pref-row-text">
                   <span class="pref-label">Hide Halo sidebars</span>
-                  <span class="pref-sub">Collapse the built-in ticket sidebars when opening Ticket 360</span>
+                  <span class="pref-sub">Collapse the built-in ticket sidebars when opening Ticket 360.</span>
                 </div>
                 <input class="pref-toggle" type="checkbox" id="prefHideHaloSidebar">
               </label>
@@ -305,17 +318,61 @@
           </div>
         </div>
 
-        <div class="settings-card settings-card-tight">
-          <span class="settings-section-kicker">In-page tools</span>
-          <h3 class="settings-section-title">Form field helpers</h3>
+        <div class="settings-card settings-card-tight pref-card">
+          <div class="pref-card-head">
+            <h3 class="settings-section-title">In-page tools</h3>
+            <p class="pref-card-copy">Small productivity helpers that live inside the Halo UI.</p>
+          </div>
           <div class="pref-list">
             <label class="pref-row" for="prefDoubleClickTechFields">
               <div class="pref-row-text">
-                <span class="pref-label">Double-click to show field API names</span>
-                <span class="pref-sub">Double-click anywhere outside an input to toggle the field/API name overlay</span>
+                <span class="pref-label">Double-click to reveal field API names</span>
+                <span class="pref-sub">Double-click anywhere outside an input to toggle the field/API name overlay.</span>
               </div>
               <input class="pref-toggle" type="checkbox" id="prefDoubleClickTechFields">
             </label>
+          </div>
+        </div>
+
+        <div class="settings-card settings-card-tight pref-card pref-card-advanced">
+          <div class="pref-card-head">
+            <span class="pref-card-eyebrow">Advanced</span>
+            <h3 class="settings-section-title">Halo tenants &amp; environments</h3>
+            <p class="pref-card-copy">Add custom Halo URLs and label each tenant so HaloPlus can warn you when you're on PROD vs sandbox.</p>
+          </div>
+          <div id="domainListWrap" class="domain-list"></div>
+          <div class="domain-add-row">
+            <button class="btn-primary" id="domainAddBtn" type="button">+ Add tenant</button>
+            <span class="domain-status" id="customDomainStatus" aria-live="polite"></span>
+          </div>
+          <div id="domainAddForm" class="domain-add-form" hidden>
+            <label class="domain-field">
+              <span class="domain-field-label">Hostname or URL</span>
+              <input id="domainAddHost" class="input-field" type="text" placeholder="support.acme.com or acme.haloitsm.com" autocomplete="off">
+            </label>
+            <div class="domain-field-row">
+              <label class="domain-field">
+                <span class="domain-field-label">Environment</span>
+                <select id="domainAddEnv" class="input-field">
+                  <option value="">Auto-detect</option>
+                  <option value="prod">PROD</option>
+                  <option value="staging">STAGING</option>
+                  <option value="uat">UAT</option>
+                  <option value="test">TEST</option>
+                  <option value="sandbox">SANDBOX</option>
+                  <option value="dev">DEV</option>
+                  <option value="unknown">Custom / other</option>
+                </select>
+              </label>
+              <label class="domain-field">
+                <span class="domain-field-label">Custom label (optional)</span>
+                <input id="domainAddLabel" class="input-field" type="text" placeholder="e.g. ACME LIVE" maxlength="24" autocomplete="off">
+              </label>
+            </div>
+            <div class="domain-add-actions">
+              <button class="btn-primary" id="domainAddConfirmBtn" type="button">Add</button>
+              <button class="btn-small" id="domainAddCancelBtn" type="button">Cancel</button>
+            </div>
           </div>
         </div>
       </div>
@@ -377,6 +434,7 @@
           </div>
           <div class="diag-actions">
             <button class="btn-primary" id="runDiagnosticsBtn" type="button">Run diagnostics</button>
+            <button class="btn-copy" id="runExtendedProbesBtn" type="button">Run extended probes</button>
             <button class="btn-copy" id="copyDiagnosticsBtn" type="button" disabled>Copy diagnostics</button>
             <span class="diag-status" id="diagCopyStatus" aria-live="polite"></span>
           </div>

@@ -1,5 +1,56 @@
 # Changelog
 
+## 1.3.0
+
+### Tenant environment labels
+- **Auto-detected environment chip injected into the Halo page.** `detectEnvironment(hostname)` classifies any Halo URL as `live`, `sandbox`, `dev`, `staging`, `uat`, or `unknown` based on subdomain patterns (`*sandbox*`, `*dev*`, `*staging*`, etc.). The chip is colour-coded per environment (red for live, amber for sandbox, blue for dev) and labels the current tenant so you instantly see whether you're about to change PROD data.
+- **Draggable chip, snaps to corners.** The chip is positioned in any of the four screen corners (top-left, top-right, bottom-left, bottom-right). Drag to reposition; on release it snaps to the nearest corner and persists the choice in `chrome.storage.local` under `huEnvChipCorner`. Defaults to bottom-right so it doesn't overlap Halo's top-bar buttons. Side panel also renders a matching `#envPill` so the environment is visible even when Halo is in the background.
+
+### Custom Halo domains, rebuilt
+- **Per-tenant `{ host, env, label }` records.** Replaces the flat hostname list with structured entries persisted under `huCustomDomainsMeta`. Each tenant carries an explicit environment classification (used for the env chip override) and an optional custom label (e.g. "ACME LIVE", "Pink Sandbox") that surfaces in the chip and palette.
+- **Manual add only.** The add-tenant dialog used to auto-open when the panel rendered with no custom domains; it now only appears when the user clicks **+ Add tenant**. The hostname input pre-fills from the page the user is currently on, so adding the current tenant is one click + Enter. Env defaults from auto-detection.
+- **Editable inline.** Each tenant row shows host, env dropdown, and label input directly in the list. Edits save on blur with a "Saved" status line, no separate edit mode.
+
+### Ticket 360
+- **Popup notes surfaced in the 360 drawer.** Reads `/api/PopupNote` and renders matching notes as a banner above the ticket summary. Honours the per-note settings: `displaymodal` shows a blocking modal variant, `dismissable` adds an X to close, `displayhtml` renders the body as HTML (sanitised), and `limitdaterange` hides the note outside its `daterangefrom` / `daterangeto` window. Useful for tenants that use popup notes for VIP / contract warnings.
+- **"Viewed by" chip.** Pulls `includeseenby=true` from `/api/tickets/{id}` and shows the agents who have looked at the ticket in the last hour as a small chip in the 360 header. Click for the full `/api/FaultViewLog` trail — when each agent last opened the ticket, sorted newest first.
+- **Audit log drawer.** New "View audit log" link in the 360 footer opens a side drawer with the ticket's full change history. Events are grouped by transaction (same agent + datetime + table) so a single save shows as one block instead of N rows. Each change shows a human-readable field label (`AUDIT_FIELD_LABELS` maps slot names like `cfaffectedservice` → "Affected service") and a resolved value when the raw audit row carries an ID — agent IDs, status IDs, priority IDs, team IDs, workflow IDs, ticket types, impact, and urgency are all resolved client-side via the existing `cache_*` lookups, with on-demand `/api/Workflow` / `/api/Priority` / `/api/Impact` / `/api/Urgency` fetches for fields without a localStorage cache. Free-text "structured" audit values (`Outcome: X\nNotes: Y`) are parsed into key/value pairs with a 2-pair minimum so prose body isn't false-positive matched. Filter input narrows by field name with a live count; chip row at the top shows the most-changed fields for quick scanning.
+- **Appointment chip.** Includes `includelastappointment=true&includenextappointment=true` on the 360 ticket fetch and renders `Next appointment: DD/MM/YYYY HH.MM` (24h, Dutch format) in the badge strip when set, falling back to last appointment. Tooltip shows the appointment subject.
+
+### Data Viewer
+- **Saved queries per table.** New star-button menu in the Data Viewer trigger row. Save the current SQL + filters under a name, recall later from the dropdown, delete from the same menu. Queries are scoped per table and persisted in `chrome.storage.local` under `huSavedQueries`. Counter chip on the star shows how many saved queries exist for the current table.
+- **Column profiles from `/api/ViewColumns`.** New column picker offers HaloPlus-curated profiles (`Recommended (top 12)`, `All columns`) plus the tenant's own saved views per entity (Tickets, Customers, Sites, Users, Assets). Per-view profiles fetch the column list lazily via `/api/ViewColumns/{id}?includedetails=true` (the list endpoint doesn't include columns even with `includedetails=true` — a quirk worked around per-view).
+- **Custom-field-aware SQL generation.** When a view profile references a column that maps to a custom-field-backed name (`CFAffectedService`, `CFLastTicket`), the generated SELECT uses the SQL form when known, falls back to a virtual placeholder when unknown. `sqlQueryableColumns()` filters out API-only columns (from `mergeApiFieldKeys`) so they're never added to the generated SQL — they used to leak in and break the query.
+- **Schema perspective toggle.** New Both / SQL / API switch above the schema list. SQL hides API-only fields (good for report writing); API hides SQL-only columns (good for integration work); Both keeps everything visible (default).
+
+### Schema explorer
+- **List-grid labels from saved views.** Calls `/api/ViewColumns?type=N&showall=true` per entity (ticket, customer, site, user, asset, supplier) and stitches the resulting `column_name → column_title_override` pairs into the explorer. Columns the user already knew about pick up a small italic chip showing the tenant's friendly title (e.g. SQL `Symptom` → "Summary"). Columns we didn't know about — but that appear in any saved view — are added as new API-only rows so the explorer surface grows automatically with the tenant's config. Cached in `chrome.storage.local` under `huViewColumnLabels` with a non-empty safety net so transient auth failures don't wipe the cache. The filter input now matches against `viewLabel` too, so typing the tenant's friendly column header lands on the right row.
+- **Clickable foreign-key chips.** `FK -> table.column` chips in the schema explorer are now interactive when the referenced table is present. Hover shows a dotted underline, click jumps to the target table, expands it, scrolls it into view, and flashes the destination column in yellow for 1.4s. Chips pointing to tables not present in our schema (e.g. legacy `xtype`, `faqlisthead`) stay as plain badges so there's no broken-link affordance.
+
+### API reference (/api)
+- **Rebuilt on a 244-endpoint catalog generated from Halo's swagger.** The hand-curated 40-endpoint list is replaced by `content/api-catalog.json`, a filtered extract of Halo's OpenAPI spec covering tickets, actions, people, knowledge, assets, communication, finance, catalogue, projects, CRM, reports & views, and setup. Each entry carries its path, HTTP methods, summary, raw swagger tag, friendly category, and the full list of path + query parameters.
+- **Search, filter, and per-endpoint details.** New sticky toolbar above the catalog: a search box that matches paths, summaries, swagger tags, category names, and parameter names (so typing `client_id` lands on every endpoint that accepts it); multi-select method chips (GET / POST / PUT / DELETE / PATCH) with persistent visual state; and a live "X of Y" count. Each endpoint row is collapsible — click to expand and see the path parameters and query parameters as monospace chips. The Copy button still copies just the path so it's paste-ready.
+
+### Diagnostics
+- **Extended endpoint probes.** A new "Run extended probes" button next to "Run diagnostics" tests 10 candidate endpoints (`/api/Agent/me`, `/api/Search`, `/api/ViewColumns`, `/api/tickets?includecolumns=true`, `/api/PopupNote`, `/api/FaultViewLog`, `/api/Notifications`, `/api/Feed`, `/api/HaloField`, `/api/Field`) and reports each one's HTTP status, latency in ms, and a top-level response shape hint (array length or top keys). Lets you see at a glance what features your tenant + role can support. Results are included in the "Copy diagnostics" output.
+- **Friendlier impersonation banner.** The diagnostics card no longer prints "Acting as agent X (real: Y)" when the "real" agent ID resolves to a customer record (i.e. doesn't exist in `cache_agent`). Impersonation is only reported when both the parent and current agent IDs exist as real agents.
+
+### Preferences UX
+- **Cards reordered and renamed.** "Display preferences" → **Ticket 360**, "Form field helpers" → **In-page tools**, "Custom Halo domains" moved to the bottom under an **Advanced** eyebrow. The uppercase kicker labels were replaced with a one-line helper paragraph so the headings carry the information.
+- **Sub-prefs stay visible when their parent is off.** The three Ticket 360 sub-toggles used to vanish when "Enable Ticket 360" was unchecked. They now stay on screen but grey out, with a left accent line connecting them to the parent — so the user can see what they'd unlock by re-enabling.
+- **Bigger, more comfortable toggles.** Toggle switches grew from 32×18 to 36×20 with a tighter focus ring for keyboard accessibility. Rows now have a hover background and small rounded corners.
+
+### API behaviour
+- **Removed `halo-app-name` and `x-halo-service` headers.** Both `haloApiRequest()` and `runHaloReport()` previously sent `halo-app-name: halo-agent-app` and `x-halo-service` markers to look like first-party requests. Halo's dev team flagged that third parties shouldn't use those headers (they identify Halo's own UI) and they're adding server-side checks. HaloPlus now identifies as a plain authenticated API caller via the bearer token. No functional change today; future-proofs against the server-side filter.
+
+### Side panel diagnostics bridge
+- **`HU_PANEL_LOG` forwarder.** The side panel now broadcasts diagnostics-style log entries through the service worker to the active content script, which writes them to the Halo page's DevTools console. Previously the side panel had its own console nobody could open while a Halo tab was active.
+
+### Fixes
+- **Data Viewer columns now match the header row.** `renderRecordRows` used to build cells from `Object.keys(rows[0])` while the header was built from `getViewerColumns()`. Result: when a column profile was applied the header showed 10 columns and the body still showed 6. Both now go through `getViewerColumns()`.
+- **Sticky API toolbar no longer leaks text.** A 10px padding-top on the shared drawer body let scrolled content show through above the sticky search toolbar in the API reference. Padding is now zeroed on the API drawer specifically; the results pane inherits the spacing from its own inset.
+- **API path text readable in dark mode.** The path chip used to inherit a bright background from Halo's host-page `code {}` rule. Explicit `background: transparent` on `.hu-api-path` plus a muted slate `#cbd5e1` foreground replaces the previous near-white and earlier orange variant.
+
 ## 1.2.1
 
 ### Palette

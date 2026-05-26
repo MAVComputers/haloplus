@@ -72,7 +72,7 @@
     "columns": {
       "uid": { "type": "int", "pk": true, "label": "User ID" },
       "Usite": { "type": "int", "label": "Site ID", "fk": "site.SSitenum" },
-      "UUsername": { "type": "nvarchar(255)", "label": "Username" },
+      "UUsername": { "type": "nvarchar(255)", "label": "Display name" },
       "Uextn": { "type": "nvarchar(30)", "label": "Main phone number" },
       "UMobile": { "type": "nvarchar(30)", "label": "Mobile number" },
       "UEmail": { "type": "nvarchar(255)", "label": "Email address" },

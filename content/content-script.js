@@ -32,7 +32,7 @@
     ticket360TicketId: 0,
     timelineTicketId: 0,
     theme: 'light',
-    settings: { auto360: true, drawer360Push: false, hideHaloSidebar: false, ticket360Enabled: true, doubleClickTechFields: true },
+    settings: { auto360: true, drawer360Push: true, hideHaloSidebar: false, ticket360Enabled: true, doubleClickTechFields: true },
     palette: { placement: 'mid', fontScale: 1 },
     review: { firstActiveAt: 0, dismissed: false, snoozeUntil: 0 },
     configTree: {},
@@ -57,12 +57,212 @@
     ticketTypeCountsLazyInFlight: null,
     ticketTypeTagsLazyInFlight: null,
     entityLoaderToken: 0,          // monotonic counter — cancels stale spinner timers
-    openLoaderToken: 0
+    openLoaderToken: 0,
+    slotLabelMap: null,            // { entityKey: { 'displayLabel': 'other1', ... } } — built from /api/Languages
+    slotLabelMapPromise: null,     // in-flight fetch promise; prevents duplicate downloads
+    customFieldMap: {},            // { entityKey: { 'displayLabel': 'CFLastTicket', ... } } — built from /api/FieldInfo per entity
+    customFieldMapPromises: {},    // { entityKey: Promise } — in-flight per-entity FieldInfo fetches
+    ticketRecordPromises: {}       // { ticketId: Promise<rawRecord> } — ticket + user/site/client expanded; used for value-matching AND runtime validation of hardcoded mappings
   };
 
   const REVIEW_DELAY_MS = 5 * 24 * 60 * 60 * 1000;
   const REVIEW_SNOOZE_MS = 7 * 24 * 60 * 60 * 1000;
   const REVIEW_URL = 'https://chromewebstore.google.com/detail/haloplus/ondioamcpkphlebmeocbhjmpdodpmklp/reviews';
+
+  // Environment label — keep these in sync with shared/constants.js. We
+  // can't include shared/constants.js in the content_scripts array without
+  // touching the manifest's load order; duplicating ~20 lines is cheaper
+  // than the inter-file dependency.
+  const ENVIRONMENT_SPECS = {
+    prod:    { label: 'PROD',    color: '#dc2626', bg: '#fee2e2', text: '#7f1d1d' },
+    staging: { label: 'STAGING', color: '#f59e0b', bg: '#fef3c7', text: '#78350f' },
+    uat:     { label: 'UAT',     color: '#8b5cf6', bg: '#ede9fe', text: '#4c1d95' },
+    test:    { label: 'TEST',    color: '#3b82f6', bg: '#dbeafe', text: '#1e3a8a' },
+    sandbox: { label: 'SANDBOX', color: '#10b981', bg: '#d1fae5', text: '#064e3b' },
+    dev:     { label: 'DEV',     color: '#10b981', bg: '#d1fae5', text: '#064e3b' },
+    unknown: { label: 'CUSTOM',  color: '#64748b', bg: '#e2e8f0', text: '#334155' }
+  };
+  const HALO_HOST_RE_LOCAL = /\.(halopsa\.com|haloitsm\.com|haloservicedesk\.com)$/i;
+
+  function detectEnvironment(hostname) {
+    if (!hostname) return 'unknown';
+    const h = String(hostname).toLowerCase();
+    // No word boundaries — hostnames concatenate words (`pinkacademysandbox`).
+    if (/(sandbox|sbx)/.test(h)) return 'sandbox';
+    if (/(staging|stage|stg)/.test(h)) return 'staging';
+    if (/(uat)/.test(h)) return 'uat';
+    if (/(test|tst)/.test(h)) return 'test';
+    if (/(devel|dev)/.test(h)) return 'dev';
+    if (HALO_HOST_RE_LOCAL.test(h)) return 'prod';
+    return 'unknown';
+  }
+
+  // Resolves the environment + optional custom label for a host. Uses the
+  // user's saved config if present, otherwise the auto-detector. Returns
+  // null only when detection comes back 'unknown' AND nothing is configured
+  // — i.e. a non-Halo host with no override. That keeps random tabs
+  // visually quiet while still labelling every real Halo surface.
+  async function resolveHostConfig(hostname) {
+    if (!hostname) return null;
+    let entry = null;
+    try {
+      const data = await new Promise(r => chrome.storage.local.get(['huCustomDomainsMeta'], r));
+      entry = (data.huCustomDomainsMeta || {})[hostname.toLowerCase()] || null;
+    } catch (_) {}
+    const detected = detectEnvironment(hostname);
+    const envOverride = entry && entry.env && ENVIRONMENT_SPECS[entry.env] ? entry.env : '';
+    const label = entry && typeof entry.label === 'string' ? entry.label.trim() : '';
+    const env = envOverride || detected;
+    if (env === 'unknown' && !label) return null;
+    return { env, label };
+  }
+
+  function removeEnvironmentBanner() {
+    const bar = document.getElementById('hu-env-bar');
+    if (bar) bar.remove();
+    const chip = document.getElementById('hu-env-chip');
+    if (chip) chip.remove();
+  }
+
+  // Chip can be dragged to any corner. We snap to the nearest corner on
+  // release rather than allowing arbitrary placement — keeps the chip
+  // predictable and out of the way of page content.
+  const ENV_CHIP_CORNERS = ['top-right','top-left','bottom-right','bottom-left'];
+  function applyEnvChipCorner(chip, bar, corner) {
+    if (!chip) return;
+    // Reset corner positioning before applying the chosen corner.
+    chip.style.top = '';
+    chip.style.bottom = '';
+    chip.style.left = '';
+    chip.style.right = '';
+    if (corner === 'top-left')     { chip.style.top = '6px';    chip.style.left = '12px'; }
+    else if (corner === 'top-right')    { chip.style.top = '6px';    chip.style.right = '12px'; }
+    else if (corner === 'bottom-left')  { chip.style.bottom = '6px'; chip.style.left = '12px'; }
+    else if (corner === 'bottom-right') { chip.style.bottom = '6px'; chip.style.right = '12px'; }
+    if (bar) {
+      // Strip moves to the same edge as the chip so the affordance reads
+      // as a unit (top vs bottom of the viewport).
+      const onTop = corner.startsWith('top');
+      bar.style.top = onTop ? '0' : '';
+      bar.style.bottom = onTop ? '' : '0';
+    }
+  }
+
+  function makeEnvChipDraggable(chip, bar) {
+    let dragging = false;
+    let moved = false;
+    let startX = 0, startY = 0;
+    const onPointerDown = (e) => {
+      // Only respond to the primary button.
+      if (e.button != null && e.button !== 0) return;
+      dragging = true;
+      moved = false;
+      startX = e.clientX;
+      startY = e.clientY;
+      // Switch to free positioning while dragging.
+      chip.style.transition = 'none';
+      chip.style.cursor = 'grabbing';
+      // Capture the pointer so we get reliable up events even if the cursor
+      // leaves the chip.
+      try { chip.setPointerCapture(e.pointerId); } catch (_) {}
+      e.preventDefault();
+    };
+    const onPointerMove = (e) => {
+      if (!dragging) return;
+      const dx = Math.abs(e.clientX - startX);
+      const dy = Math.abs(e.clientY - startY);
+      if (!moved && (dx > 3 || dy > 3)) moved = true;
+      if (!moved) return;
+      // Free-position the chip under the cursor (with a small offset).
+      chip.style.top = '';
+      chip.style.bottom = '';
+      chip.style.left = '';
+      chip.style.right = '';
+      chip.style.top  = (e.clientY - 12) + 'px';
+      chip.style.left = (e.clientX - 24) + 'px';
+    };
+    const onPointerUp = (e) => {
+      if (!dragging) return;
+      dragging = false;
+      chip.style.cursor = 'grab';
+      try { chip.releasePointerCapture(e.pointerId); } catch (_) {}
+      if (!moved) return;
+      // Snap to the nearest corner based on the chip's centre.
+      const rect = chip.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const corner = (cy < vh / 2 ? 'top' : 'bottom') + '-' + (cx < vw / 2 ? 'left' : 'right');
+      applyEnvChipCorner(chip, bar, corner);
+      try { chrome.storage.local.set({ huEnvChipCorner: corner }); } catch (_) {}
+    };
+    chip.addEventListener('pointerdown', onPointerDown);
+    chip.addEventListener('pointermove', onPointerMove);
+    chip.addEventListener('pointerup', onPointerUp);
+    chip.addEventListener('pointercancel', onPointerUp);
+  }
+
+  function injectEnvironmentBanner(env, customLabel) {
+    // A thin coloured strip at the top of the viewport plus a small corner
+    // chip. Chip is draggable across the four corners so it doesn't fight
+    // with Halo's own buttons.
+    if (window !== window.top) return; // don't inject inside iframes
+    const spec = ENVIRONMENT_SPECS[env] || ENVIRONMENT_SPECS.unknown;
+    let bar = document.getElementById('hu-env-bar');
+    let chip;
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = 'hu-env-bar';
+      bar.style.cssText = [
+        'position:fixed','left:0','right:0','top:0','height:3px','z-index:2147483640',
+        'pointer-events:none'
+      ].join(';');
+      chip = document.createElement('div');
+      chip.id = 'hu-env-chip';
+      chip.style.cssText = [
+        'position:fixed','top:6px','right:12px','z-index:2147483641',
+        'padding:3px 10px','border-radius:99px','font:600 10px/1.3 system-ui,-apple-system,Segoe UI,sans-serif',
+        'letter-spacing:0.08em','text-transform:uppercase',
+        'box-shadow:0 1px 3px rgba(0,0,0,0.15)','pointer-events:auto',
+        'cursor:grab','user-select:none','touch-action:none'
+      ].join(';');
+      document.documentElement.appendChild(bar);
+      document.documentElement.appendChild(chip);
+      makeEnvChipDraggable(chip, bar);
+      // Apply the saved corner if any. Default to bottom-right (out of the
+      // way of Halo's top-right toolbar buttons).
+      try {
+        chrome.storage.local.get(['huEnvChipCorner'], data => {
+          const corner = ENV_CHIP_CORNERS.includes(data && data.huEnvChipCorner)
+            ? data.huEnvChipCorner : 'bottom-right';
+          applyEnvChipCorner(chip, bar, corner);
+        });
+      } catch (_) {}
+    } else {
+      chip = document.getElementById('hu-env-chip');
+    }
+    bar.style.background = spec.color;
+    if (chip) {
+      chip.style.background = spec.bg;
+      chip.style.color = spec.text;
+      chip.style.border = '1px solid ' + spec.color;
+      const label = (customLabel && String(customLabel).trim()) || spec.label;
+      chip.textContent = label;
+      chip.title = `HaloPlus: ${label} environment (${location.hostname}). Drag to move.` +
+                   (env === 'prod' ? '\nChanges affect the real system.' : '');
+    }
+  }
+
+  function refreshEnvironmentBanner() {
+    resolveHostConfig(location.hostname).then(config => {
+      if (!config) {
+        removeEnvironmentBanner();
+        return;
+      }
+      injectEnvironmentBanner(config.env, config.label);
+    }).catch(() => {});
+  }
 
   const ROUTES = {
     ticket:   { list: '/tickets?area=1',             detail: id => `/tickets?id=${encodeURIComponent(id)}` },
@@ -86,67 +286,6 @@
     config:   { list: '/config',                     detail: id => `/config?selid=${encodeURIComponent(id)}` }
   };
 
-  const API_RESOURCES = [
-    { category: 'Tickets & ITSM', endpoints: [
-      { path: '/api/tickets',         methods: 'GET POST',        desc: 'List, search and create tickets / incidents' },
-      { path: '/api/tickets/{id}',    methods: 'GET PUT DELETE',  desc: 'Get, update or delete a ticket' },
-      { path: '/api/actions',         methods: 'GET POST',        desc: 'Ticket actions - notes, emails, replies' },
-      { path: '/api/actions/{id}',    methods: 'GET PUT DELETE',  desc: 'Get, update or delete an action' },
-      { path: '/api/statuses',        methods: 'GET',             desc: 'List ticket statuses' },
-      { path: '/api/priority',        methods: 'GET',             desc: 'List ticket priorities' },
-      { path: '/api/requesttype',     methods: 'GET',             desc: 'List request / ticket types' },
-      { path: '/api/sla',             methods: 'GET',             desc: 'List SLA policies' }
-    ]},
-    { category: 'Problems & Changes', endpoints: [
-      { path: '/api/problems',        methods: 'GET POST',        desc: 'List and create problem records' },
-      { path: '/api/problems/{id}',   methods: 'GET PUT DELETE',  desc: 'Manage a problem record' },
-      { path: '/api/changes',         methods: 'GET POST',        desc: 'List and create change requests' },
-      { path: '/api/changes/{id}',    methods: 'GET PUT DELETE',  desc: 'Manage a change request' },
-      { path: '/api/releases',        methods: 'GET POST',        desc: 'List and create releases' },
-      { path: '/api/releases/{id}',   methods: 'GET PUT DELETE',  desc: 'Manage a release' }
-    ]},
-    { category: 'Customers & People', endpoints: [
-      { path: '/api/client',          methods: 'GET POST',        desc: 'List and create customers / clients' },
-      { path: '/api/client/{id}',     methods: 'GET PUT DELETE',  desc: 'Manage a customer record' },
-      { path: '/api/users',           methods: 'GET POST',        desc: 'List and create end-user contacts' },
-      { path: '/api/users/{id}',      methods: 'GET PUT DELETE',  desc: 'Manage a user contact' },
-      { path: '/api/agent',           methods: 'GET POST',        desc: 'List and create agents / technicians' },
-      { path: '/api/agent/{id}',      methods: 'GET PUT',         desc: 'Manage an agent record' },
-      { path: '/api/team',            methods: 'GET POST',        desc: 'List agent teams' },
-      { path: '/api/site',            methods: 'GET POST',        desc: 'List and create sites / locations' },
-      { path: '/api/site/{id}',       methods: 'GET PUT DELETE',  desc: 'Manage a site record' }
-    ]},
-    { category: 'Assets', endpoints: [
-      { path: '/api/asset',           methods: 'GET POST',        desc: 'List and create assets / CIs' },
-      { path: '/api/asset/{id}',      methods: 'GET PUT DELETE',  desc: 'Manage an asset record' },
-      { path: '/api/assettype',       methods: 'GET',             desc: 'List asset types' },
-      { path: '/api/softwarelicence', methods: 'GET POST',        desc: 'Manage software licences' }
-    ]},
-    { category: 'Knowledge Base', endpoints: [
-      { path: '/api/kbentry',         methods: 'GET POST',        desc: 'List and create KB articles' },
-      { path: '/api/kbentry/{id}',    methods: 'GET PUT DELETE',  desc: 'Manage a KB article' }
-    ]},
-    { category: 'Projects', endpoints: [
-      { path: '/api/projects',        methods: 'GET POST',        desc: 'List and create projects' },
-      { path: '/api/projects/{id}',   methods: 'GET PUT DELETE',  desc: 'Manage a project' },
-      { path: '/api/projecttask',     methods: 'GET POST',        desc: 'Manage project tasks' }
-    ]},
-    { category: 'Finance', endpoints: [
-      { path: '/api/invoice',         methods: 'GET POST',        desc: 'List and create invoices' },
-      { path: '/api/invoice/{id}',    methods: 'GET PUT DELETE',  desc: 'Manage an invoice' },
-      { path: '/api/quotation',       methods: 'GET POST',        desc: 'List and create quotes' },
-      { path: '/api/quotation/{id}',  methods: 'GET PUT DELETE',  desc: 'Manage a quote' },
-      { path: '/api/purchaseorder',   methods: 'GET POST',        desc: 'List and create purchase orders' },
-      { path: '/api/supplier',        methods: 'GET POST',        desc: 'List and create suppliers' }
-    ]},
-    { category: 'Config & Reporting', endpoints: [
-      { path: '/api/Report',          methods: 'POST',            desc: 'Run a custom SQL report query' },
-      { path: '/api/dashboard',       methods: 'GET',             desc: 'List dashboards' },
-      { path: '/api/customfield',     methods: 'GET',             desc: 'List custom field definitions' },
-      { path: '/api/department',      methods: 'GET POST',        desc: 'List and create departments' },
-      { path: '/api/category',        methods: 'GET',             desc: 'List categories / ticket categories' }
-    ]}
-  ];
 
   const BASE_COMMANDS = [
     // ITSM navigation
@@ -555,6 +694,60 @@
     } finally {
       HU.entityAccessProbeInFlight = null;
     }
+  }
+
+  // Audit candidates not yet wired into the app — probed on demand from the
+  // Diagnostics card so we know which endpoints are reachable for this
+  // tenant + agent role before investing UI work.
+  const EXTENDED_PROBE_TARGETS = [
+    { path: '/api/Agent/me',                                          purpose: 'Replace token-claim probing with first-party identity' },
+    { path: '/api/Search?search=test&count_per_entity=2',             purpose: 'Universal search — palette upgrade' },
+    { path: '/api/ViewColumns?type=1',                                purpose: 'Authoritative list-column labels (SQL↔API bridge)' },
+    { path: '/api/tickets?count=1&includecolumns=true',               purpose: 'Embedded column labels on tickets list' },
+    { path: '/api/PopupNote?showall=true',                            purpose: 'Popup notes for 360 card (VIP / contract warnings)' },
+    { path: '/api/FaultViewLog',                                      purpose: '"Viewed by" trail for tickets' },
+    { path: '/api/Notifications?count=5',                             purpose: 'In-app notification feed (palette badge)' },
+    { path: '/api/Feed?count=5',                                      purpose: 'Followed-record activity feed' },
+    { path: '/api/HaloField',                                         purpose: 'Undocumented field metadata — probe to confirm shape' },
+    { path: '/api/Field?kind=ticket',                                  purpose: 'Entity field definitions' }
+  ];
+
+  async function runExtendedProbes() {
+    const results = await Promise.all(EXTENDED_PROBE_TARGETS.map(async target => {
+      const start = Date.now();
+      try {
+        const data = await haloApiRequest(target.path);
+        const ms = Date.now() - start;
+        let shape = '';
+        if (data && typeof data === 'object') {
+          if (Array.isArray(data)) {
+            shape = `array(${data.length})`;
+          } else {
+            const topKeys = Object.keys(data).slice(0, 4).join(', ');
+            shape = topKeys ? `{${topKeys}${Object.keys(data).length > 4 ? ', …' : ''}}` : '{}';
+          }
+        } else if (data == null) {
+          shape = 'null';
+        } else {
+          shape = typeof data;
+        }
+        return { path: target.path, purpose: target.purpose, status: 'ok', ms, shape };
+      } catch (e) {
+        const ms = Date.now() - start;
+        const msg = String(e && e.message || '');
+        const lower = msg.toLowerCase();
+        let status = 'unknown';
+        let httpCode = '';
+        const codeMatch = msg.match(/\b(4\d\d|5\d\d)\b/);
+        if (codeMatch) httpCode = codeMatch[1];
+        if (lower.includes('401') || lower.includes('unauthorized')) status = 'unauthorized';
+        else if (lower.includes('403') || lower.includes('forbidden') || lower.includes('permission')) status = 'forbidden';
+        else if (lower.includes('404') || lower.includes('not found')) status = 'notfound';
+        else if (codeMatch) status = 'error';
+        return { path: target.path, purpose: target.purpose, status, ms, httpCode, error: msg };
+      }
+    }));
+    return { results, probedAt: new Date().toISOString() };
   }
 
   // BASE_COMMAND.id → entity-API route via ENTITY_SEARCH_MAP, falling back to
@@ -974,7 +1167,28 @@
 
       const currentAgentId = localStorage.getItem('currloggedonuser') || '';
       const parentAgentId  = localStorage.getItem('P_currloggedonuser') || '';
-      const isImpersonating = !!parentAgentId && parentAgentId !== currentAgentId;
+
+      // `P_currloggedonuser` differing from `currloggedonuser` is NOT a
+      // reliable impersonation signal on its own — Halo's localStorage can
+      // carry a stale or user-record id (not an agent id) under that key
+      // from prior sessions. Only treat it as impersonation when both ids
+      // resolve to known agents in `cache_agent`. Falling back to "not
+      // impersonating" is the safe default; the worst case is hiding the
+      // banner for a genuinely impersonating session, which a page reload
+      // (which repopulates cache_agent) would correct.
+      let isImpersonating = !!parentAgentId && parentAgentId !== currentAgentId;
+      let staleImpersonationMarker = false;
+      if (isImpersonating) {
+        const agents = readHaloCacheLookup('cache_agent');
+        if (agents && agents.size) {
+          const parentExists  = agents.has(Number(parentAgentId));
+          const currentExists = agents.has(Number(currentAgentId));
+          if (!parentExists || !currentExists) {
+            isImpersonating = false;
+            staleImpersonationMarker = true;
+          }
+        }
+      }
 
       HU.permissions = {
         isAdmin,
@@ -987,6 +1201,7 @@
         currentAgentId,
         parentAgentId,
         isImpersonating,
+        staleImpersonationMarker,
         cacheRoles: (localStorage.getItem('cache_roles') || '').split(',').filter(Boolean)
       };
     } catch (e) {
@@ -1094,11 +1309,10 @@
 
   async function runHaloReport(sql, name) {
     const token = getAccessToken();
+    // No `halo-app-name` / `x-halo-service`: Halo flagged third-party use of those first-party-UI markers.
     const headers = {
       accept: '*/*',
-      'content-type': 'application/json',
-      'halo-app-name': 'halo-agent-app',
-      'x-halo-service': 'ReportService'
+      'content-type': 'application/json'
     };
 
     if (token) headers.authorization = `Bearer ${token}`;
@@ -1131,15 +1345,13 @@
   }
 
   async function haloApiRequest(path, options = {}) {
-    // Matches the Halo UI's exact header set for /api/* entity endpoints.
-    // The token MUST be read live from the access_token cookie because Halo
-    // rotates it; cached tokens (localStorage / earlier reads) routinely 401.
+    // Token MUST be read live every call: Halo rotates the cookie mid-session, cached reads 401.
+    // No `halo-app-name` / `x-halo-service`: Halo flagged third-party use of those first-party-UI markers.
     const token = getAccessToken();
     const method = String(options.method || 'GET').toUpperCase();
     const headers = {
       accept: '*/*',
       'content-type': 'application/json',
-      'halo-app-name': 'halo-agent-app',
       'cache-control': 'no-cache',
       'pragma': 'no-cache'
     };
@@ -1663,9 +1875,15 @@ FROM (
       .hu-palette-footer {
         border-top: 1px solid #e3e7ef; padding: 9px 14px 10px; background: #fbfcff;
         color: #667085; font-size: calc(12px * var(--hu-palette-font-scale));
+        display: flex; align-items: flex-start; justify-content: space-between; gap: 10px;
       }
       .hu-palette-footer .hu-result-title { color: #172033; font-size: calc(12px * var(--hu-palette-font-scale)); }
       .hu-palette-footer .hu-result-sub { font-size: calc(11px * var(--hu-palette-font-scale)); white-space: normal; }
+      .hu-palette-env {
+        font-size: 9.5px; font-weight: 700; letter-spacing: 0.08em;
+        padding: 2px 7px; border-radius: 99px;
+        border: 1px solid; flex-shrink: 0; align-self: center;
+      }
       .hu-drawer {
         position: fixed; right: 18px; top: 72px; bottom: 24px; width: min(520px, calc(100vw - 36px));
         z-index: 2147483599; background: #fff; color: #172033; border: 1px solid #d8dde8; border-radius: 8px;
@@ -1685,7 +1903,29 @@ FROM (
         display: inline-flex; margin-left: 6px; padding: 1px 5px; border-radius: 5px;
         background: #eef4ff; color: #2259bc; border: 1px solid #cbd9f6;
         font-family: "SF Mono", "Cascadia Code", Consolas, monospace; font-size: 10px; vertical-align: baseline;
+        cursor: pointer;
+        user-select: none;
+        transition: background-color 120ms ease, color 120ms ease, border-color 120ms ease, transform 80ms ease;
       }
+      .hu-field-tag:hover {
+        background: #dbe7ff; border-color: #a8c1f0;
+      }
+      .hu-field-tag:active {
+        transform: scale(0.95);
+      }
+      .hu-field-tag-copied {
+        background: #d4f5dc !important; color: #1a7f3a !important; border-color: #8fdba3 !important;
+      }
+      .hu-field-tag-related {
+        background: #fff4e0; color: #a8590a; border-color: #f0d4a3;
+      }
+      .hu-field-tag-related:hover {
+        background: #ffe6c2; border-color: #e6b977;
+      }
+      .hu-field-tag-related .hu-field-tag-entity {
+        font-weight: 700; opacity: 0.85;
+      }
+      .hu-field-tag-related .hu-field-tag-sep { opacity: 0.55; padding: 0 1px; }
       .hu-table-column-tag {
         display: inline-flex; width: max-content; max-width: 48%;
         overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -1704,6 +1944,102 @@ FROM (
       .hu-api-row { cursor: default; }
       .hu-api-row:hover { background: #f8fafc; }
       .hu-api-row-inner { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; width: 100%; }
+      /* API reference v2 — search + filter + collapsible params */
+      /* Drawer body has padding: 10px which creates a gap above the sticky
+         toolbar that scrolled content shows through. Zero out the top/side
+         padding only on the API drawer; the toolbar provides its own. */
+      #hu-api-drawer .hu-drawer-body { padding: 0; }
+      .hu-api-toolbar {
+        position: sticky; top: 0; z-index: 10;
+        display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+        padding: 10px; background: #fff; border-bottom: 1px solid #e3e7ef;
+      }
+      .hu-api-results { padding: 0 10px 10px; }
+      .hu-api-search {
+        flex: 1 1 220px; min-width: 0;
+        padding: 6px 10px; font-size: 12px;
+        border: 1px solid #d8dde8; border-radius: 6px;
+        background: #fff; color: #172033;
+        outline: none;
+      }
+      .hu-api-search:focus { border-color: #ff9b51; box-shadow: 0 0 0 3px rgba(255,155,81,0.18); }
+      .hu-api-methods { display: flex; gap: 4px; flex-wrap: wrap; }
+      .hu-api-method-chip {
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 10px; font-weight: 700;
+        padding: 4px 8px; border-radius: 99px;
+        border: 1px solid #d8dde8; background: #fff; color: #5e7290;
+        cursor: pointer; transition: background 0.12s, color 0.12s, border-color 0.12s;
+      }
+      .hu-api-method-chip:hover { border-color: #b5bdcc; color: #25343f; }
+      .hu-api-method-chip.is-active { background: #25343f; color: #fff; border-color: #25343f; }
+      .hu-api-count {
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 11px; color: #667085; margin-left: auto;
+      }
+      .hu-api-empty { padding: 24px 12px; text-align: center; color: #667085; font-size: 12px; }
+      .hu-api-cat-count {
+        display: inline-block; margin-left: 6px;
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 10px; padding: 1px 6px; border-radius: 99px;
+        background: rgba(255,155,81,0.12); color: #b8651f;
+        font-weight: 700; letter-spacing: 0;
+      }
+      .hu-api-row-v2 {
+        display: block !important;
+        padding: 8px 10px;
+        border-bottom: 1px solid #edf0f5;
+      }
+      .hu-api-row-head {
+        display: flex; align-items: center; justify-content: space-between; gap: 10px;
+      }
+      .hu-api-toggle {
+        background: transparent; border: 0; padding: 0;
+        display: flex; align-items: center; gap: 6px;
+        cursor: pointer; min-width: 0; flex: 1;
+        text-align: left;
+      }
+      .hu-api-arrow { color: #8694a0; font-size: 10px; flex-shrink: 0; transition: transform 0.12s ease; }
+      .hu-api-path {
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 12px; color: #25343f; font-weight: 600;
+        overflow-wrap: anywhere;
+        background: transparent;
+        padding: 0;
+      }
+      .hu-api-meta { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+      .hu-api-summary { font-size: 11px; color: #667085; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .hu-api-methods-tag {
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 9.5px; font-weight: 700; letter-spacing: 0.04em;
+        padding: 2px 6px; border-radius: 4px;
+        background: rgba(34, 89, 188, 0.10); color: #2259bc;
+        border: 1px solid rgba(34, 89, 188, 0.22);
+      }
+      .hu-api-copy { font-size: 10px; padding: 2px 8px; }
+      .hu-api-detail {
+        margin-top: 8px; padding: 8px 10px;
+        background: #f7f9fc; border: 1px solid #e3e7ef; border-radius: 6px;
+        font-size: 11px;
+      }
+      .hu-api-param-row {
+        display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+        margin-bottom: 4px;
+      }
+      .hu-api-param-row:last-child { margin-bottom: 0; }
+      .hu-api-param-label {
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 9.5px; letter-spacing: 0.08em; text-transform: uppercase;
+        color: #8694a0; font-weight: 700;
+        min-width: 40px;
+      }
+      .hu-api-param {
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 11px;
+        background: #fff; border: 1px solid #d8dde8; padding: 1px 6px; border-radius: 4px;
+        color: #b8651f;
+      }
+      .hu-api-noparams { color: #8694a0; font-style: italic; font-size: 11px; }
       .hu-card {
         background: #fff;
         border: 1px solid #e3e7ef;
@@ -1855,6 +2191,189 @@ FROM (
       .hu-360-banner-important { background: rgba(245,158,11,0.10); border-color: rgba(245,158,11,0.35); color: #b07209; }
       .hu-360-banner-approval  { background: rgba(59,130,246,0.10); border-color: rgba(59,130,246,0.35); color: #2563eb; }
       .hu-360-banner-major     { background: rgba(239,68,68,0.12);  border-color: rgba(239,68,68,0.40);  color: #c92626; }
+      .hu-360-banner-popupnote { background: rgba(245,158,11,0.10); border-color: rgba(245,158,11,0.35); color: #b07209; align-items: flex-start; }
+      .hu-360-banner-popupnote-modal {
+        background: rgba(239,68,68,0.12);
+        border-color: rgba(239,68,68,0.45);
+        border-width: 1.5px;
+        color: #c92626;
+        box-shadow: 0 0 0 4px rgba(239,68,68,0.06);
+      }
+      .hu-360-popup-content { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+      .hu-360-popup-body { font-weight: 400; font-size: 11.5px; color: inherit; white-space: pre-wrap; word-break: break-word; opacity: 0.95; }
+      .hu-360-popup-meta { font-size: 10.5px; opacity: 0.7; font-weight: 500; }
+      .hu-360-popup-close {
+        flex-shrink: 0;
+        width: 20px; height: 20px;
+        border: 0; background: transparent;
+        color: currentColor; opacity: 0.55;
+        font-size: 16px; line-height: 1;
+        cursor: pointer; padding: 0;
+        border-radius: 50%;
+        margin-left: 4px;
+      }
+      .hu-360-popup-close:hover { opacity: 1; background: rgba(0,0,0,0.06); }
+      html.hu-theme-dark .hu-360-popup-close:hover { background: rgba(255,255,255,0.08); }
+
+      /* Ticket 360 footer (audit link etc.) */
+      .hu-360-footer { padding: 14px 14px 18px; display: flex; justify-content: flex-end; }
+      .hu-360-foot-link {
+        background: none; border: 0; padding: 4px 0;
+        font: 500 11.5px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+        color: #8694a0; cursor: pointer; letter-spacing: 0.01em;
+        opacity: 0.75; transition: opacity 0.14s, color 0.14s;
+      }
+      .hu-360-foot-link:hover { color: #25343f; opacity: 1; }
+      html.hu-theme-dark .hu-360-foot-link { color: #6b7a8c; }
+      html.hu-theme-dark .hu-360-foot-link:hover { color: #edf1f7; }
+
+      /* Audit log drawer */
+      .hu-audit-header { padding-bottom: 4px; border-bottom: 1px solid #edf0f5; }
+      .hu-audit-filter-row {
+        display: flex; align-items: center; gap: 8px; padding: 6px 12px 10px;
+      }
+      .hu-audit-filter {
+        flex: 1; min-width: 0;
+        padding: 6px 10px; font-size: 12px;
+        border: 1px solid #d8dde8; border-radius: 6px;
+        background: #fff; color: #172033;
+        outline: none;
+      }
+      .hu-audit-filter:focus { border-color: #ff9b51; box-shadow: 0 0 0 3px rgba(255,155,81,0.18); }
+      .hu-audit-filter-count {
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 10.5px; color: #667085; flex-shrink: 0;
+      }
+      html.hu-theme-dark .hu-audit-header { border-bottom-color: #2b3548; }
+      html.hu-theme-dark .hu-audit-filter { background: #0f1626; border-color: #2b3548; color: #edf1f7; }
+      html.hu-theme-dark .hu-audit-filter-count { color: #94a3b8; }
+      .hu-audit-field-chips {
+        display: flex; flex-wrap: wrap; gap: 5px;
+        padding: 2px 12px 10px;
+      }
+      .hu-audit-chip {
+        font-size: 10.5px; font-weight: 600;
+        padding: 3px 9px; border-radius: 99px;
+        border: 1px solid #d8dde8;
+        background: #fff; color: #5e7290;
+        cursor: pointer;
+        transition: background 0.12s, color 0.12s, border-color 0.12s;
+      }
+      .hu-audit-chip:hover { border-color: #b5bdcc; color: #25343f; }
+      .hu-audit-chip.is-active {
+        background: #25343f; color: #fff; border-color: #25343f;
+      }
+      .hu-audit-chip-count {
+        display: inline-block; margin-left: 4px;
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 9.5px; opacity: 0.7;
+        padding: 1px 4px; border-radius: 99px;
+        background: rgba(0,0,0,0.04);
+      }
+      .hu-audit-chip.is-active .hu-audit-chip-count {
+        background: rgba(255,255,255,0.18);
+      }
+      html.hu-theme-dark .hu-audit-chip {
+        background: #1a2236; border-color: #303744; color: #a7afbd;
+      }
+      html.hu-theme-dark .hu-audit-chip:hover { border-color: #45526a; color: #edf1f7; }
+      html.hu-theme-dark .hu-audit-chip.is-active {
+        background: #ff9b51; color: #25343f; border-color: #ff9b51;
+      }
+      html.hu-theme-dark .hu-audit-chip-count { background: rgba(255,255,255,0.06); }
+      html.hu-theme-dark .hu-audit-chip.is-active .hu-audit-chip-count {
+        background: rgba(0,0,0,0.18);
+      }
+      .hu-audit-change { padding: 2px 0; }
+      .hu-audit-change + .hu-audit-change { border-top: 1px dashed rgba(0,0,0,0.04); margin-top: 2px; padding-top: 4px; }
+      html.hu-theme-dark .hu-audit-change + .hu-audit-change { border-top-color: rgba(255,255,255,0.05); }
+      .hu-audit-change-head { margin-bottom: 4px; }
+      .hu-audit-kv {
+        display: grid;
+        grid-template-columns: max-content 1fr;
+        gap: 2px 12px;
+        margin-top: 2px;
+        padding: 6px 10px;
+        background: rgba(0,0,0,0.025);
+        border-radius: 5px;
+        border-left: 2px solid rgba(34,89,188,0.20);
+      }
+      html.hu-theme-dark .hu-audit-kv { background: rgba(255,255,255,0.03); border-left-color: rgba(99,142,220,0.30); }
+      .hu-audit-kv-row { display: contents; }
+      .hu-audit-kv-key {
+        font-size: 10.5px; font-weight: 600; color: #667085;
+        letter-spacing: 0.01em; white-space: nowrap; padding-top: 1px;
+      }
+      .hu-audit-kv-val {
+        font-size: 11.5px; color: #25343f; word-break: break-word;
+      }
+      html.hu-theme-dark .hu-audit-kv-key { color: #94a3b8; }
+      html.hu-theme-dark .hu-audit-kv-val { color: #edf1f7; }
+      .hu-audit-inferred-note {
+        margin-top: 4px; font-size: 10.5px; color: #8694a0;
+        font-style: italic; padding-left: 12px;
+      }
+      html.hu-theme-dark .hu-audit-inferred-note { color: #6b7a8c; }
+      .hu-audit-tx-count {
+        font-size: 10px; font-weight: 700; letter-spacing: 0.06em;
+        text-transform: uppercase;
+        background: rgba(34,89,188,0.10); color: #2259bc;
+        border: 1px solid rgba(34,89,188,0.22);
+        padding: 1px 6px; border-radius: 99px;
+      }
+      html.hu-theme-dark .hu-audit-tx-count {
+        background: rgba(99,142,220,0.15); color: #9ab9ff; border-color: rgba(99,142,220,0.35);
+      }
+      .hu-audit-detail.is-collapsed {
+        display: -webkit-box;
+        -webkit-line-clamp: 3;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+      }
+      .hu-audit-toggle {
+        background: none; border: 0; padding: 2px 0; margin-top: 2px;
+        font-size: 10.5px; color: #ff9b51; cursor: pointer; font-weight: 600;
+        margin-left: 48px;
+      }
+      .hu-audit-toggle:hover { text-decoration: underline; }
+
+      .hu-audit-group { margin-bottom: 12px; }
+      .hu-audit-group-h {
+        font-size: 10.5px; font-weight: 700; text-transform: uppercase;
+        letter-spacing: 0.06em; color: #8694a0;
+        padding: 10px 12px 4px; border-bottom: 1px solid #edf0f5;
+      }
+      .hu-audit-list { display: flex; flex-direction: column; padding: 2px 0; }
+      .hu-audit-row { padding: 7px 12px; border-bottom: 1px solid #edf0f5; font-size: 11.5px; }
+      .hu-audit-row:last-child { border-bottom: 0; }
+      .hu-audit-head { display: flex; gap: 10px; margin-bottom: 3px; align-items: baseline; }
+      .hu-audit-time {
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 10.5px; color: #8694a0; flex-shrink: 0;
+        min-width: 38px;
+      }
+      .hu-audit-who { font-weight: 700; color: #25343f; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .hu-audit-detail { color: #5e7290; word-break: break-word; padding-left: 48px; }
+      .hu-audit-detail strong { color: #25343f; font-weight: 600; }
+      .hu-audit-old { color: #b91c1c; text-decoration: line-through; opacity: 0.8; }
+      .hu-audit-new { color: #15803d; }
+      .hu-audit-empty { color: #8694a0; font-style: italic; }
+      .hu-audit-outcome {
+        font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 99px;
+        background: rgba(255,155,81,0.10); color: #b8651f;
+      }
+      .hu-audit-table { font-size: 10.5px; color: #8694a0; font-style: italic; }
+      html.hu-theme-dark .hu-audit-group-h { color: #6b7a8c; border-bottom-color: #2b3548; }
+      html.hu-theme-dark .hu-audit-row { border-bottom-color: #2b3548; }
+      html.hu-theme-dark .hu-audit-time { color: #6b7a8c; }
+      html.hu-theme-dark .hu-audit-who { color: #edf1f7; }
+      html.hu-theme-dark .hu-audit-detail { color: #a7afbd; }
+      html.hu-theme-dark .hu-audit-detail strong { color: #edf1f7; }
+      html.hu-theme-dark .hu-audit-old { color: #fca5a5; }
+      html.hu-theme-dark .hu-audit-new { color: #86efac; }
+      html.hu-theme-dark .hu-audit-empty { color: #6b7a8c; }
+      html.hu-theme-dark .hu-audit-outcome { background: rgba(255,155,81,0.18); color: #ffb37a; }
+      html.hu-theme-dark .hu-audit-table { color: #6b7a8c; }
 
       /* Aging + activity chips inside the hero card */
       .hu-360-aging { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
@@ -2048,6 +2567,23 @@ FROM (
         .hu-section-row { background: #1a2236; border-color: #303744; }
         .hu-section-label { color: #a7afbd; }
         .hu-api-row:hover { background: #1d2533; }
+        .hu-api-toolbar { background: #151d2c; border-bottom-color: #303744; }
+        .hu-api-search { background: #0f1626; border-color: #303744; color: #edf1f7; }
+        .hu-api-search:focus { border-color: #ff9b51; }
+        .hu-api-method-chip { background: #1a2236; border-color: #303744; color: #a7afbd; }
+        .hu-api-method-chip:hover { border-color: #45526a; color: #edf1f7; }
+        .hu-api-method-chip.is-active { background: #ff9b51; color: #25343f; border-color: #ff9b51; }
+        .hu-api-count { color: #94a3b8; }
+        .hu-api-empty { color: #94a3b8; }
+        .hu-api-row-v2 { border-bottom-color: #2b3548; }
+        .hu-api-path { color: #cbd5e1; background: transparent; }
+        .hu-api-summary { color: #94a3b8; }
+        .hu-api-cat-count { background: rgba(255,155,81,0.18); color: #ffb37a; }
+        .hu-api-methods-tag { background: rgba(99, 142, 220, 0.15); color: #9ab9ff; border-color: rgba(99, 142, 220, 0.35); }
+        .hu-api-detail { background: #0f1626; border-color: #2b3548; }
+        .hu-api-param-label { color: #6b7a8c; }
+        .hu-api-param { background: #1a2236; border-color: #303744; color: #ffb37a; }
+        .hu-api-noparams { color: #6b7a8c; }
         .hu-card { background: #1a2236; border-color: #303744; box-shadow: none; }
         .hu-ticket-hero { background: linear-gradient(135deg, #25343f 0%, #314754 100%); border-color: rgba(255, 155, 81, 0.24); }
         .hu-section-title, .hu-section-title-row, .hu-stat-value, .hu-list-title, .hu-list-note { color: #edf1f7; }
@@ -2296,15 +2832,25 @@ FROM (
         width: 140px; height: 72px;
         animation: hu-360-donut-fade 0.45s ease-out;
       }
-      /* Caption sits 8px under the arc (arc renders in the top 48px of the
-         SVG), so it has the full 140px width to work with and never clips
-         through the donut graph. */
+      /* Status icon sits in the centre of the donut bowl (arc apex at y=4,
+         arc ends at y=44, so the bowl midline is around y=24). Uses flex to
+         centre the SVG because a sibling rule forces .hu-360-sla-donut svg
+         to display:block, which breaks text-align centring. */
+      #hu-ticket360-drawer .hu-360-sla-donut-center-icon {
+        position: absolute; left: 0; right: 0; top: 30px;
+        display: flex; justify-content: center; align-items: center;
+        pointer-events: none;
+      }
+      #hu-ticket360-drawer .hu-360-sla-donut-center-icon svg {
+        width: 18px; height: 18px;
+      }
+      /* Caption sits 8px under the arc, with the full 140px to work with. */
       #hu-ticket360-drawer .hu-360-sla-donut-center {
         position: absolute; left: 0; right: 0; top: 56px;
         text-align: center; pointer-events: none;
         font-size: 11.5px; font-weight: 600; letter-spacing: 0.01em;
         font-variant-numeric: tabular-nums;
-        display: flex; align-items: center; justify-content: center; gap: 4px;
+        display: flex; align-items: center; justify-content: center;
         line-height: 1.2;
       }
       /* Truncate with an ellipsis if a label is somehow wider than 140px. */
@@ -2312,9 +2858,12 @@ FROM (
         overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
         min-width: 0;
       }
-      #hu-ticket360-drawer .hu-360-sla-donut-center.is-ok     { color: #22c55e; }
-      #hu-ticket360-drawer .hu-360-sla-donut-center.is-warn   { color: #fbbf24; }
-      #hu-ticket360-drawer .hu-360-sla-donut-center.is-danger { color: #fca5a5; }
+      #hu-ticket360-drawer .hu-360-sla-donut-center.is-ok,
+      #hu-ticket360-drawer .hu-360-sla-donut-center-icon.is-ok     { color: #22c55e; }
+      #hu-ticket360-drawer .hu-360-sla-donut-center.is-warn,
+      #hu-ticket360-drawer .hu-360-sla-donut-center-icon.is-warn   { color: #fbbf24; }
+      #hu-ticket360-drawer .hu-360-sla-donut-center.is-danger,
+      #hu-ticket360-drawer .hu-360-sla-donut-center-icon.is-danger { color: #d74a46; }
       .hu-sla-status-icon { vertical-align: -1px; flex-shrink: 0; }
       @keyframes hu-360-donut-fade {
         from { opacity: 0; transform: scale(0.88); }
@@ -2440,9 +2989,28 @@ FROM (
       #hu-ticket360-drawer .hu-360-wf-bar { display: flex; gap: 3px; margin-bottom: 16px; }
       #hu-ticket360-drawer .hu-360-wf-seg {
         flex: 1; height: 3px; border-radius: 2px; background: rgba(255,255,255,0.08);
+        overflow: hidden;
+        transition: height 0.18s ease-out;
       }
       #hu-ticket360-drawer .hu-360-wf-seg.is-on { background: #538dba; }
       #hu-ticket360-drawer .hu-360-wf-seg.is-current { background: #9ec5e5; }
+      /* Stage labels are always in the DOM but invisible at rest. On bar hover
+         the segments grow and the labels fade in. */
+      #hu-ticket360-drawer .hu-360-wf-seg-label {
+        display: block;
+        font-size: 9.5px; line-height: 20px; font-weight: 600;
+        color: #fff;
+        text-shadow: 0 1px 1px rgba(0,0,0,0.35);
+        text-align: center; padding: 0 6px;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        opacity: 0;
+        transition: opacity 0.12s ease-out 0.05s;
+        pointer-events: none;
+      }
+      #hu-ticket360-drawer .hu-360-wf-bar:hover .hu-360-wf-seg { height: 20px; }
+      #hu-ticket360-drawer .hu-360-wf-bar:hover .hu-360-wf-seg-label { opacity: 1; }
+      /* Pause the pulse while expanded so the label isn't fading in/out. */
+      #hu-ticket360-drawer .hu-360-wf-bar:hover .hu-360-wf-seg.is-current { animation: none; }
       @keyframes hu-360-wf-pulse {
         0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(158,197,229,0.45); }
         50%      { opacity: 0.1; box-shadow: 0 0 0 3px rgba(158,197,229,0); }
@@ -2451,8 +3019,10 @@ FROM (
         animation: hu-360-wf-pulse 4s ease-in-out infinite;
       }
       @media (prefers-reduced-motion: reduce) {
-        #hu-ticket360-drawer .hu-360-wf-bar.is-active .hu-360-wf-seg.is-current {
-          animation: none;
+        #hu-ticket360-drawer .hu-360-wf-bar.is-active .hu-360-wf-seg.is-current,
+        #hu-ticket360-drawer .hu-360-wf-seg,
+        #hu-ticket360-drawer .hu-360-wf-seg-label {
+          animation: none; transition: none;
         }
       }
 
@@ -2835,9 +3405,12 @@ FROM (
       html.hu-theme-light #hu-ticket360-drawer .hu-ticket-id { color: #5e7290; }
       html.hu-theme-light #hu-ticket360-drawer .hu-ticket-summary { color: #172033; }
       html.hu-theme-light #hu-ticket360-drawer .hu-360-sla-donut-track { color: #e3e7ef; }
-      html.hu-theme-light #hu-ticket360-drawer .hu-360-sla-donut-center.is-ok     { color: #15803d; }
-      html.hu-theme-light #hu-ticket360-drawer .hu-360-sla-donut-center.is-warn   { color: #b45309; }
-      html.hu-theme-light #hu-ticket360-drawer .hu-360-sla-donut-center.is-danger { color: #b91c1c; }
+      html.hu-theme-light #hu-ticket360-drawer .hu-360-sla-donut-center.is-ok,
+      html.hu-theme-light #hu-ticket360-drawer .hu-360-sla-donut-center-icon.is-ok     { color: #15803d; }
+      html.hu-theme-light #hu-ticket360-drawer .hu-360-sla-donut-center.is-warn,
+      html.hu-theme-light #hu-ticket360-drawer .hu-360-sla-donut-center-icon.is-warn   { color: #b45309; }
+      html.hu-theme-light #hu-ticket360-drawer .hu-360-sla-donut-center.is-danger,
+      html.hu-theme-light #hu-ticket360-drawer .hu-360-sla-donut-center-icon.is-danger { color: #b91c1c; }
       html.hu-theme-light #hu-ticket360-drawer .hu-ticket-summary--editable:hover {
         background: #f1f4fa; outline-color: #e3e7ef;
       }
@@ -3052,6 +3625,23 @@ FROM (
       html.hu-theme-dark .hu-section-row { background: #1a2236; border-color: #303744; }
       html.hu-theme-dark .hu-section-label { color: #a7afbd; }
       html.hu-theme-dark .hu-api-row:hover { background: #1d2533; }
+      html.hu-theme-dark .hu-api-toolbar { background: #151d2c; border-bottom-color: #303744; }
+      html.hu-theme-dark .hu-api-search { background: #0f1626; border-color: #303744; color: #edf1f7; }
+      html.hu-theme-dark .hu-api-search:focus { border-color: #ff9b51; }
+      html.hu-theme-dark .hu-api-method-chip { background: #1a2236; border-color: #303744; color: #a7afbd; }
+      html.hu-theme-dark .hu-api-method-chip:hover { border-color: #45526a; color: #edf1f7; }
+      html.hu-theme-dark .hu-api-method-chip.is-active { background: #ff9b51; color: #25343f; border-color: #ff9b51; }
+      html.hu-theme-dark .hu-api-count { color: #94a3b8; }
+      html.hu-theme-dark .hu-api-empty { color: #94a3b8; }
+      html.hu-theme-dark .hu-api-row-v2 { border-bottom-color: #2b3548; }
+      html.hu-theme-dark .hu-api-path { color: #cbd5e1; background: transparent; }
+      html.hu-theme-dark .hu-api-summary { color: #94a3b8; }
+      html.hu-theme-dark .hu-api-cat-count { background: rgba(255,155,81,0.18); color: #ffb37a; }
+      html.hu-theme-dark .hu-api-methods-tag { background: rgba(99, 142, 220, 0.15); color: #9ab9ff; border-color: rgba(99, 142, 220, 0.35); }
+      html.hu-theme-dark .hu-api-detail { background: #0f1626; border-color: #2b3548; }
+      html.hu-theme-dark .hu-api-param-label { color: #6b7a8c; }
+      html.hu-theme-dark .hu-api-param { background: #1a2236; border-color: #303744; color: #ffb37a; }
+      html.hu-theme-dark .hu-api-noparams { color: #6b7a8c; }
       html.hu-theme-dark .hu-card { background: #1a2236; border-color: #303744; box-shadow: none; }
       html.hu-theme-dark .hu-ticket-hero { background: linear-gradient(135deg, #25343f 0%, #314754 100%); border-color: rgba(255, 155, 81, 0.24); }
       html.hu-theme-dark .hu-section-title,
@@ -4109,7 +4699,19 @@ ORDER BY TABLE_NAME, ORDINAL_POSITION
         <span class="hu-result-title">${escapeHtml(title)}</span>
         <span class="hu-result-sub">${escapeHtml(subtitle)}</span>
       </span>
+      <span id="hu-palette-env-slot"></span>
     `;
+
+    // Env chip — only when the host is configured. Async storage read; if
+    // the host isn't configured, leave the slot empty.
+    resolveHostConfig(location.hostname).then(config => {
+      const slot = document.getElementById('hu-palette-env-slot');
+      if (!slot) return;
+      if (!config) { slot.innerHTML = ''; return; }
+      const spec = ENVIRONMENT_SPECS[config.env] || ENVIRONMENT_SPECS.unknown;
+      const label = (config.label && config.label.trim()) || spec.label;
+      slot.innerHTML = `<span class="hu-palette-env" style="background:${spec.bg};color:${spec.text};border-color:${spec.color}" title="Environment label">${escapeHtml(label)}</span>`;
+    }).catch(() => {});
   }
 
   function getImpersonationQuery(query) {
@@ -5446,6 +6048,742 @@ ${orderBy}
     };
   }
 
+  // Maps raw SQL column names (Halo stores audit `value` as the column
+  // identifier) to friendly labels an agent would recognise. Anything not
+  // in this map falls through to the raw value with first-letter cleanup.
+  const AUDIT_FIELD_LABELS = {
+    agent_id:       'Assignee',
+    agent:          'Assignee',
+    status_id:      'Status',
+    status:         'Status',
+    priority_id:    'Priority',
+    priority:       'Priority',
+    tickettype_id:  'Ticket type',
+    tickettype:     'Ticket type',
+    team_id:        'Team',
+    team:           'Team',
+    client_id:      'Customer',
+    customer:       'Customer',
+    site_id:        'Site',
+    site:           'Site',
+    user_id:        'End user',
+    user:           'End user',
+    workflow_id:    'Workflow',
+    workflow_step:  'Workflow step',
+    category_1:     'Category',
+    category_2:     'Subcategory',
+    category_3:     'Sub-subcategory',
+    category_4:     'Category L4',
+    dateassigned:   'Assigned date',
+    fixbydate:      'Fix-by date',
+    respondbydate:  'Respond-by date',
+    dateoccurred:   'Opened',
+    dateclosed:     'Closed',
+    datecleared:    'Cleared',
+    summary:        'Summary',
+    details:        'Details',
+    sla_id:         'SLA',
+    sla:            'SLA',
+    flagged:        'Flagged',
+    impact_id:      'Impact',
+    urgency_id:     'Urgency',
+    review_date:    'Review date'
+  };
+
+  // Fields whose `from`/`to` values are IDs we can resolve to names via
+  // Halo's localStorage caches. The cache lookup is best-effort: when the
+  // cache doesn't contain the id (or is empty), we fall through to the
+  // raw value so the diff still reads.
+  const AUDIT_ID_CACHES = {
+    agent_id:      'cache_agent',
+    status_id:     'cache_status',
+    priority_id:   'cache_priority',
+    tickettype_id: 'cache_tickettype',
+    team_id:       'cache_team'
+  };
+
+  // Lookup-backed audit resolvers. Each entry describes how to fetch a
+  // Map<id, name> for one or more audit field names that store IDs but
+  // don't have a Halo localStorage cache to resolve them from. Loaded
+  // once per session, cached in HU.auditLookupMaps keyed by `kind`.
+  //
+  // Halo's `/api/Lookup` returns array of { id, value, ... } where `value`
+  // is the friendly name. The lookupid varies by tenant (impact/urgency
+  // both surface as numbered lookup tables), so we surface whatever Halo
+  // returns and fall through to the raw id when there's no match.
+  const AUDIT_API_RESOLVERS = {
+    workflow_id: {
+      kind: 'workflow',
+      url: '/api/Workflow?includeinactive=true',
+      arrayKeys: ['workflows', 'flowheaders'],
+      nameOf: w => w.name || w.description
+    },
+    // Priority falls back to the API when cache_priority isn't populated
+    // (happens on direct-URL ticket loads before Halo's React app has
+    // warmed up its localStorage caches).
+    priority_id: {
+      kind: 'priority',
+      url: '/api/Priority',
+      arrayKeys: ['priorities', 'policies', 'items'],
+      nameOf: w => w.name || w.description
+    },
+    // Halo's impact/urgency live in /api/Lookup but the lookupid varies
+    // per tenant. We try the two most-common defaults; the first one
+    // that returns any rows wins.
+    impact_id: {
+      kind: 'impact',
+      // Halo's standard impact lookup is typically lookupid=10 in the
+      // out-of-the-box config; some tenants use 110 or other ids.
+      url: '/api/Lookup?lookupid=10',
+      arrayKeys: ['lookups', 'partslookups', 'items'],
+      nameOf: w => w.name || w.value || w.text || w.description
+    },
+    urgency_id: {
+      kind: 'urgency',
+      url: '/api/Lookup?lookupid=11',
+      arrayKeys: ['lookups', 'partslookups', 'items'],
+      nameOf: w => w.name || w.value || w.text || w.description
+    }
+  };
+
+  function loadAuditApiLookup(fieldKey) {
+    const cfg = AUDIT_API_RESOLVERS[fieldKey];
+    if (!cfg) return Promise.resolve(null);
+    if (!HU.auditLookupMaps) HU.auditLookupMaps = {};
+    if (!HU.auditLookupPromises) HU.auditLookupPromises = {};
+    if (HU.auditLookupMaps[cfg.kind] instanceof Map) return Promise.resolve(HU.auditLookupMaps[cfg.kind]);
+    if (HU.auditLookupPromises[cfg.kind]) return HU.auditLookupPromises[cfg.kind];
+    HU.auditLookupPromises[cfg.kind] = haloApiRequest(cfg.url).then(resp => {
+      let arr = Array.isArray(resp) ? resp : null;
+      if (!arr) {
+        for (const k of cfg.arrayKeys) {
+          if (Array.isArray(resp?.[k])) { arr = resp[k]; break; }
+        }
+      }
+      if (!arr) arr = [];
+      const map = new Map();
+      arr.forEach(item => {
+        if (item == null) return;
+        // /api/Priority exposes a GUID at `id` and the numeric audit-id at `priorityid` (no underscore). Halo's other lookup endpoints follow the same no-underscore convention.
+        const candidates = [
+          item.priorityid, item.statusid, item.workflowid, item.lookupid, item.tid, item.code,
+          item.priority_id, item.lookup_id, item.workflow_id
+        ];
+        let rawId = null;
+        for (const c of candidates) {
+          if (c != null && Number.isFinite(Number(c))) { rawId = c; break; }
+        }
+        if (rawId == null && item.id != null && Number.isFinite(Number(item.id))) {
+          rawId = item.id;
+        }
+        const id = rawId != null ? Number(rawId) : null;
+        if (id == null || !Number.isFinite(id)) return;
+        const name = cfg.nameOf(item)
+                  || item.name || item.value || item.text || item.description;
+        map.set(id, String(name || (cfg.kind.charAt(0).toUpperCase() + cfg.kind.slice(1) + ' #' + id)));
+      });
+      HU.auditLookupMaps[cfg.kind] = map;
+      return map;
+    }).catch(() => {
+      const empty = new Map();
+      HU.auditLookupMaps[cfg.kind] = empty;
+      return empty;
+    });
+    return HU.auditLookupPromises[cfg.kind];
+  }
+
+  function prettyAuditField(raw) {
+    if (!raw) return '';
+    const key = String(raw).trim().toLowerCase();
+    if (AUDIT_FIELD_LABELS[key]) return AUDIT_FIELD_LABELS[key];
+    // Generic fallback: snake_case → "Snake case"
+    return key.replace(/_/g, ' ').replace(/^\w/, c => c.toUpperCase());
+  }
+
+  // Halo dumps multi-field summaries into the `to` column for creation
+  // rows: "Action Date/Time: ... - Action Note: ... Subject: ... Type:
+  // ... Start: ... End: ...". Parse those into structured key/value
+  // pairs so we can render them as a clean list instead of one wall of
+  // text. Returns null when the input doesn't look structured.
+  //
+  // `minPairs` lets the caller relax the threshold: a Ticket-Created
+  // row may only have "Symptom: wefe" (single pair) yet still benefits
+  // from the KV layout, while a regular field-change line shouldn't
+  // accidentally get re-formatted.
+  function parseStructuredAuditValue(text, minPairs) {
+    if (!text || typeof text !== 'string') return null;
+    const threshold = Number.isFinite(minPairs) ? minPairs : 2;
+    // A "key:" is a Title-Cased word (or multi-word phrase) followed by a
+    // colon. Allow `/` (Action Date/Time), spaces, and parentheses.
+    const re = /([A-Z][A-Za-z][A-Za-z ()\/]{0,40}?):\s?/g;
+    const hits = [];
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      hits.push({ start: m.index, keyEnd: m.index + m[0].length, key: m[1].trim() });
+    }
+    if (hits.length < threshold) return null;
+    const pairs = [];
+    for (let i = 0; i < hits.length; i++) {
+      const next = hits[i + 1];
+      const valueStart = hits[i].keyEnd;
+      const valueEnd = next ? next.start : text.length;
+      let value = text.slice(valueStart, valueEnd).trim();
+      // Strip trailing " - " separator Halo inserts between segments.
+      value = value.replace(/\s*-\s*$/, '').trim();
+      if (value) pairs.push({ key: hits[i].key, value });
+    }
+    return pairs.length >= threshold ? pairs : null;
+  }
+
+  function resolveAuditValue(field, raw, apiMaps) {
+    if (raw == null || raw === '') return '';
+    const key = String(field).trim().toLowerCase();
+    const id = Number(raw);
+
+    // Try Halo localStorage caches first (fast, no fetch).
+    const cacheKey = AUDIT_ID_CACHES[key];
+    if (cacheKey && Number.isFinite(id) && id > 0) {
+      const name = getCachedName(cacheKey, id);
+      if (name) return name;
+    }
+
+    // Then API-backed lookup maps the caller pre-fetched.
+    if (apiMaps && Number.isFinite(id) && id > 0) {
+      const apiCfg = AUDIT_API_RESOLVERS[key];
+      if (apiCfg && apiMaps[apiCfg.kind] instanceof Map) {
+        const name = apiMaps[apiCfg.kind].get(id);
+        if (name) return name;
+      }
+    }
+
+    return String(raw);
+  }
+
+  // Audit log — on-demand fetch (with include_auditing=true), separate
+  // from the cached loadTicketRecord call because the payload can be huge.
+  async function openAuditLogDrawer(ticketId) {
+    injectStyles();
+    closeDrawer('hu-audit-drawer');
+
+    const drawer = createDrawer('hu-audit-drawer', `Audit log · #${ticketId}`);
+    const body = drawer.querySelector('.hu-drawer-body');
+    body.innerHTML = '<div class="hu-row"><span class="hu-row-title">Loading audit log…</span></div>';
+    openDrawer(drawer);
+
+    let ticket;
+    try {
+      ticket = await haloApiRequest(
+        `/api/tickets/${ticketId}?include_auditing=true&nocache=true`
+      );
+    } catch (e) {
+      body.innerHTML = `<div class="hu-row"><span class="hu-row-title">Couldn't load audit log</span><span class="hu-row-sub">${escapeHtml(String(e?.message || e))}</span></div>`;
+      return;
+    }
+
+    // Halo returns four parallel audit arrays on the ticket payload:
+    //   audit_log    — general entries (status changes, field edits, etc.)
+    //   auditstatus  — status-only changes
+    //   auditunum    — agent / assignee changes
+    //   auditdate    — date-field changes
+    // All four share the same row schema: { id, date, agent_id, username,
+    // value, from, to, table_name, ... }. Merging them gives the full trail.
+    const candidateKeys = ['audit_log', 'auditstatus', 'auditunum', 'auditdate',
+                           'auditing', 'audit', 'audits', 'audit_trail', 'audit_history'];
+    const rows = [];
+    candidateKeys.forEach(k => {
+      const v = ticket && ticket[k];
+      if (Array.isArray(v)) v.forEach(r => rows.push(r));
+    });
+
+    // Pre-fetch API-backed lookups for any field in the rows that we
+    // resolve via /api (workflow, impact, urgency). Halo's localStorage
+    // caches handle status/priority/agent/etc. synchronously.
+    const usedApiFields = new Set();
+    rows.forEach(r => {
+      const k = String(r.value || '').trim().toLowerCase();
+      if (AUDIT_API_RESOLVERS[k]) usedApiFields.add(k);
+    });
+    const apiMapEntries = await Promise.all(
+      [...usedApiFields].map(k =>
+        loadAuditApiLookup(k).then(map => [AUDIT_API_RESOLVERS[k].kind, map])
+      )
+    );
+    const apiMaps = Object.fromEntries(apiMapEntries);
+    if (!Array.isArray(rows) || !rows.length) {
+      body.innerHTML = '<div class="hu-row"><span class="hu-row-title">No audit entries</span><span class="hu-row-sub">Halo did not return an audit trail for this ticket. The ticket may be too new, or your role may not have audit access.</span></div>';
+      return;
+    }
+
+    // Sort newest first by full timestamp.
+    const sorted = rows.slice().sort((a, b) => {
+      const da = parseHaloDate(a.date || '').getTime() || 0;
+      const db = parseHaloDate(b.date || '').getTime() || 0;
+      return db - da;
+    });
+
+    // Group by date header (DD/MM/YYYY). All entries from the same day
+    // cluster under one heading; within a group they stay newest-first.
+    const formatDateHeading = (d) => {
+      const pad = (n) => String(n).padStart(2, '0');
+      const today = new Date();
+      const dStart = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+      const tStart = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
+      const dayDiff = Math.round((tStart - dStart) / 86400000);
+      const dmy = `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}`;
+      if (dayDiff === 0) return 'Today · ' + dmy;
+      if (dayDiff === 1) return 'Yesterday · ' + dmy;
+      return dmy;
+    };
+    const formatTime = (d) => {
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${pad(d.getHours())}.${pad(d.getMinutes())}`;
+    };
+
+    const groups = [];           // [{ heading, rows: [] }]
+    const byHeading = new Map();
+    sorted.forEach(r => {
+      const d = parseHaloDate(r.date || '');
+      if (!d || isNaN(d.getTime())) return;
+      const heading = formatDateHeading(d);
+      if (!byHeading.has(heading)) {
+        const g = { heading, rows: [] };
+        byHeading.set(heading, g);
+        groups.push(g);
+      }
+      byHeading.get(heading).rows.push({ row: r, when: d });
+    });
+
+    body.innerHTML = '';
+
+    // Header + filter input. The filter matches against field labels,
+    // raw values, the resolved from/to text, and the username — so the
+    // user can search by anything they see on screen. Below the text
+    // input we render one chip per distinct field that's been changed,
+    // so the user can drill in on a specific field without typing.
+    const header = document.createElement('div');
+    header.className = 'hu-audit-header';
+    header.innerHTML = `
+      <div class="hu-row" style="border-bottom:0">
+        <span class="hu-row-title" id="hu-audit-headline">Loading audit summary…</span>
+        <span class="hu-row-sub">Newest first. Filter below to drill in.</span>
+      </div>
+      <div class="hu-audit-filter-row">
+        <input type="text" class="hu-audit-filter" id="hu-audit-filter" placeholder="Filter by field, value, or who…" autocomplete="off" />
+        <span class="hu-audit-filter-count" id="hu-audit-filter-count"></span>
+      </div>
+      <div class="hu-audit-field-chips" id="hu-audit-field-chips"></div>
+    `;
+    body.appendChild(header);
+
+    // Pre-resolve the friendly + raw text per row, then fold rows that
+    // came from the same "save transaction" — same user, same table,
+    // same timestamp (or same audit_num/auditnum if Halo exposes one) —
+    // into one entry with multiple field changes.
+    //
+    // Halo doesn't ship a stable audit-batch id in the v1 schema we
+    // see (id, ticket_id, agent_id, date, value, to, from, table_name,
+    // id1, actoutcome, user_id, username, isintegrator), but multiple
+    // fields edited in one save share the exact same `date` timestamp
+    // because they're written in the same transaction. We bucket by
+    // (date + username + table_name) which is precise enough in practice.
+    const txKey = (r) => {
+      const explicit = r.auditnum || r.audit_num || r.audit_id || r.batch_id;
+      if (explicit) return 'tx:' + explicit;
+      const ms = parseHaloDate(r.date || '').getTime() || 0;
+      // Round to the second so two writes a few ms apart still group.
+      const sec = Math.floor(ms / 1000);
+      const who = String(r.username || r.agent_id || '');
+      const tbl = String(r.table_name || '');
+      return `t:${sec}|w:${who}|b:${tbl}`;
+    };
+
+    // Convert one Halo audit row into a normalised "change" record.
+    // Halo's `value` for creation events is usually "<Entity> ID <n> Created"
+    // (e.g. "Action ID 7 Created", "Ticket ID 3174 Created"). When the row
+    // also carries an `actoutcome` we use that as the friendly label —
+    // "Appointment Created" reads better than "Action ID 7 Created" — and
+    // drop the duplicate outcome chip below. Same for plain "<Entity>
+    // Created" with no outcome (becomes "Action created", "Ticket created").
+    const CREATED_RE = /^(\w+(?:\s+\w+)*?)\s+id\s+\d+\s+created$/i;
+    const toChange = (r) => {
+      const rawField = String(r.value || '').trim();
+      const outcome = String(r.actoutcome || '').trim();
+      let fieldLabel;
+      let outcomeUsedAsLabel = false;
+      const isCreation = CREATED_RE.test(rawField);
+      if (isCreation) {
+        const createdMatch = rawField.match(CREATED_RE);
+        if (outcome) {
+          // Outcome already typically reads "Appointment Created" — use as-is
+          // but normalise the case of the second word.
+          fieldLabel = outcome.replace(/\bCreated\b/i, 'created');
+          outcomeUsedAsLabel = true;
+        } else {
+          const entity = createdMatch[1];
+          fieldLabel = entity.charAt(0).toUpperCase() + entity.slice(1).toLowerCase() + ' created';
+        }
+      } else {
+        fieldLabel = prettyAuditField(rawField);
+      }
+      const rawOld = r.from != null ? String(r.from) : '';
+      const rawNew = r.to   != null ? String(r.to)   : '';
+      const oldV = resolveAuditValue(rawField, rawOld, apiMaps);
+      const newV = resolveAuditValue(rawField, rawNew, apiMaps);
+      return { fieldLabel, rawField, oldV, newV, rawOld, rawNew, outcome, outcomeUsedAsLabel, isCreation };
+    };
+
+    const enriched = [];
+    const txByKey = new Map();
+    groups.forEach(g => {
+      g.rows.forEach(({ row: r, when }) => {
+        const who = String(r.username || '').trim()
+                  || (r.agent_id ? (getCachedName('cache_agent', r.agent_id) || ('Agent #' + r.agent_id)) : 'System');
+        const tableQual = String(r.table_name || '').trim();
+        const key = txKey(r);
+        let tx = txByKey.get(key);
+        if (!tx) {
+          tx = {
+            groupHeading: g.heading, when, who, tableQual,
+            changes: [],
+            searchBlob: ''
+          };
+          txByKey.set(key, tx);
+          enriched.push(tx);
+        }
+        const change = toChange(r);
+        tx.changes.push(change);
+        tx.searchBlob += ` ${change.fieldLabel} ${change.rawField} ${change.oldV} ${change.newV} ${change.rawOld} ${change.rawNew} ${change.outcome} ${tableQual} ${who}`.toLowerCase();
+      });
+    });
+
+    // Fill in the headline now that we know the transaction count.
+    const headline = document.getElementById('hu-audit-headline');
+    if (headline) {
+      const txCount = enriched.length;
+      const changeCount = enriched.reduce((n, tx) => n + tx.changes.length, 0);
+      const dayCount = groups.length;
+      headline.textContent = `${txCount} ${txCount === 1 ? 'save' : 'saves'}`
+        + ` · ${changeCount} field change${changeCount === 1 ? '' : 's'}`
+        + ` across ${dayCount} day${dayCount === 1 ? '' : 's'}`;
+    }
+
+    // Build the inferred "initial state" snapshot for the ticket itself.
+    // Halo only writes audit rows for *changes*, not for the initial save —
+    // so a field that was set at creation and never changed has no row.
+    // But for fields that DID change later, the earliest row's `from` is
+    // the value the ticket had at creation. Collect those and we can
+    // attach them as a "Set at creation" extra block to the Ticket
+    // Created transaction.
+    //
+    // We sort changes oldest-first per field; only consider rows on the
+    // ticket itself (table_name = faults/fault). Skip change rows whose
+    // raw column is a creation-marker (`X ID N Created`) or whose `from`
+    // is empty.
+    const fieldFirstFrom = new Map(); // fieldLabel → first `oldV` value
+    const ticketTableRows = [];
+    enriched.forEach(tx => {
+      const isTicketTable = !tx.tableQual || /^(faults?|fault)$/i.test(tx.tableQual);
+      if (!isTicketTable) return;
+      tx.changes.forEach(c => {
+        if (c.isCreation) return;
+        if (!c.fieldLabel || !c.oldV) return;
+        ticketTableRows.push({ when: tx.when, label: c.fieldLabel, oldV: c.oldV });
+      });
+    });
+    ticketTableRows.sort((a, b) => a.when - b.when);
+    ticketTableRows.forEach(r => {
+      if (!fieldFirstFrom.has(r.label)) fieldFirstFrom.set(r.label, r.oldV);
+    });
+    // Surface as a sorted array of {key,value} for rendering.
+    const inferredInitialFields = [...fieldFirstFrom.entries()]
+      .map(([key, value]) => ({ key, value }))
+      .sort((a, b) => a.key.localeCompare(b.key));
+
+    // Fold the inferred fields onto the Ticket Created transaction so
+    // they participate in BOTH the text filter and the field-chip filter
+    // (e.g. typing "priority" or clicking the Priority chip should also
+    // surface the creation row when priority was set at creation).
+    if (inferredInitialFields.length) {
+      const ticketCreationTx = enriched.find(tx =>
+        tx.changes.some(c => c.isCreation && /^ticket\b/i.test(c.rawField.match(CREATED_RE)?.[1] || ''))
+      );
+      if (ticketCreationTx) {
+        ticketCreationTx.virtualFields = inferredInitialFields.map(f => f.key);
+        inferredInitialFields.forEach(f => {
+          ticketCreationTx.searchBlob += ` ${f.key} ${f.value}`.toLowerCase();
+        });
+      }
+    }
+
+    // Collect every distinct field touched by any change, with counts so
+    // we can sort by frequency. Skip empty/system labels so the chip row
+    // stays clean. Virtual fields (inferred initial state on the Ticket
+    // Created tx) count too — clicking "Priority" should surface the
+    // creation row when priority was set at creation.
+    //
+    // Suppress the "Ticket created" chip itself when its tx has virtual
+    // fields, since the inferred subfield chips (Priority, Status, …)
+    // already let the user drill in. Other creation outcomes like
+    // "Appointment created" stay because they don't have virtual fields.
+    const fieldCounts = new Map();
+    enriched.forEach(tx => {
+      const hasVirtual = !!(tx.virtualFields && tx.virtualFields.length);
+      tx.changes.forEach(c => {
+        const label = (c.fieldLabel || '').trim();
+        if (!label) return;
+        if (c.isCreation && hasVirtual) return;
+        fieldCounts.set(label, (fieldCounts.get(label) || 0) + 1);
+      });
+      (tx.virtualFields || []).forEach(label => {
+        const k = String(label || '').trim();
+        if (!k) return;
+        fieldCounts.set(k, (fieldCounts.get(k) || 0) + 1);
+      });
+    });
+    const fieldList = [...fieldCounts.entries()]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+
+    const selectedFields = new Set();
+    const chipsHost = document.getElementById('hu-audit-field-chips');
+    if (chipsHost && fieldList.length) {
+      const allChip = document.createElement('button');
+      allChip.type = 'button';
+      allChip.className = 'hu-audit-chip is-active';
+      allChip.dataset.field = '';
+      allChip.textContent = 'All fields';
+      chipsHost.appendChild(allChip);
+
+      fieldList.forEach(([label, count]) => {
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'hu-audit-chip';
+        chip.dataset.field = label;
+        chip.innerHTML = `${escapeHtml(label)} <span class="hu-audit-chip-count">${count}</span>`;
+        chipsHost.appendChild(chip);
+      });
+
+      chipsHost.addEventListener('click', (e) => {
+        const chip = e.target.closest('.hu-audit-chip');
+        if (!chip) return;
+        const field = chip.dataset.field;
+        if (field === '') {
+          selectedFields.clear();
+        } else if (selectedFields.has(field)) {
+          selectedFields.delete(field);
+        } else {
+          selectedFields.add(field);
+        }
+        chipsHost.querySelectorAll('.hu-audit-chip').forEach(el => {
+          const isAll = el.dataset.field === '';
+          const active = isAll ? selectedFields.size === 0 : selectedFields.has(el.dataset.field);
+          el.classList.toggle('is-active', active);
+        });
+        render(document.getElementById('hu-audit-filter')?.value || '');
+      });
+    }
+
+    const listsHost = document.createElement('div');
+    body.appendChild(listsHost);
+
+    // Render with the active filter applied. Always rebuild the entire
+    // grouped list so empty groups can disappear cleanly when filtered.
+    // Filters compose: text filter AND (no fields selected OR transaction
+    // touches at least one selected field).
+    function render(filterText) {
+      const lower = (filterText || '').trim().toLowerCase();
+      listsHost.innerHTML = '';
+      const hasFieldFilter = selectedFields.size > 0;
+      const filtered = enriched.filter(tx => {
+        if (lower && !tx.searchBlob.includes(lower)) return false;
+        if (hasFieldFilter) {
+          const realMatch = tx.changes.some(c => selectedFields.has((c.fieldLabel || '').trim()));
+          if (realMatch) return true;
+          // Virtual fields cover inferred initial state on Ticket Created.
+          const virtualMatch = (tx.virtualFields || []).some(f => selectedFields.has((f || '').trim()));
+          return virtualMatch;
+        }
+        return true;
+      });
+
+      const countEl = document.getElementById('hu-audit-filter-count');
+      if (countEl) {
+        const showCount = lower || hasFieldFilter;
+        countEl.textContent = showCount
+          ? `${filtered.length} match${filtered.length === 1 ? '' : 'es'}`
+          : '';
+      }
+
+      if (!filtered.length) {
+        listsHost.innerHTML = '<div class="hu-row"><span class="hu-row-title">No entries match</span><span class="hu-row-sub">Clear the filter to see everything.</span></div>';
+        return;
+      }
+
+      // Regroup the filtered set by date heading, preserving original order.
+      const byHeading = new Map();
+      const orderedHeadings = [];
+      filtered.forEach(e => {
+        if (!byHeading.has(e.groupHeading)) {
+          byHeading.set(e.groupHeading, []);
+          orderedHeadings.push(e.groupHeading);
+        }
+        byHeading.get(e.groupHeading).push(e);
+      });
+
+      orderedHeadings.forEach(heading => {
+        const entries = byHeading.get(heading);
+        const groupEl = document.createElement('div');
+        groupEl.className = 'hu-audit-group';
+        groupEl.innerHTML = `<div class="hu-audit-group-h">${escapeHtml(heading)}</div>`;
+        const list = document.createElement('div');
+        list.className = 'hu-audit-list';
+
+        entries.forEach(tx => {
+          const whenStr = formatTime(tx.when);
+
+          // Find a "Ticket created" change in this transaction so we can
+          // optionally tack the inferred-initial-state block onto its KV
+          // list (only one such marker per ticket lifecycle).
+          const ticketCreationChange = tx.changes.find(c =>
+            c.isCreation && CREATED_RE.test(c.rawField) &&
+            /^ticket\b/i.test(c.rawField.match(CREATED_RE)?.[1] || '')
+          );
+
+          // Per-change visibility under the active filters. The outer tx
+          // filter has already kept this tx because *something* matches;
+          // we now narrow to just the matching changes so sibling fields
+          // don't leak through when the user filtered by chip / text.
+          const txHasVirtual = !!(tx.virtualFields && tx.virtualFields.length);
+          const changeVisible = (c) => {
+            if (c === ticketCreationChange && txHasVirtual) {
+              // The Ticket Created change is kept whenever any of its
+              // inferred virtual fields pass the filter — its KV list is
+              // filtered separately below.
+              const matchingVirtualField = tx.virtualFields.find(vf => {
+                const labelOk = !hasFieldFilter || selectedFields.has(vf);
+                if (!labelOk) return false;
+                if (!lower) return true;
+                const inferredKv = (inferredInitialFields.find(f => f.key === vf) || {}).value || '';
+                return `${vf} ${inferredKv}`.toLowerCase().includes(lower);
+              });
+              return !!matchingVirtualField;
+            }
+            const labelOk = !hasFieldFilter || selectedFields.has((c.fieldLabel || '').trim());
+            if (!labelOk) return false;
+            if (!lower) return true;
+            const blob = `${c.fieldLabel} ${c.rawField} ${c.oldV} ${c.newV} ${c.rawOld} ${c.rawNew} ${c.outcome}`.toLowerCase();
+            return blob.includes(lower);
+          };
+          const visibleChanges = tx.changes.filter(changeVisible);
+          // Belt-and-braces: if nothing visible (shouldn't happen given
+          // the outer filter), skip the tx entirely.
+          if (!visibleChanges.length) return;
+
+          // Build one diff line per field change in the transaction.
+          const changeLinesHtml = visibleChanges.map(c => {
+            // Detect Halo's multi-field "Key: value - Key: value" dumps
+            // (creation rows for actions, appointments, etc.) and render
+            // them as a structured key/value list instead of inline diff.
+            // Use a relaxed threshold for known creation rows so a
+            // single "Symptom: wefe" still renders cleanly.
+            const minPairs = c.isCreation ? 1 : 2;
+            const structured = c.oldV ? null : parseStructuredAuditValue(c.newV, minPairs);
+            if (structured) {
+              const head = c.fieldLabel
+                ? `<div class="hu-audit-change-head"><strong>${escapeHtml(c.fieldLabel)}</strong></div>`
+                : '';
+              // For the Ticket Created change, merge in the inferred
+              // initial state for any other audited field so the user
+              // can see the full picture of what the ticket looked like
+              // at creation time. When filters are active, narrow the
+              // inferred items to just those matching the filters so the
+              // KV list isn't padded with unrelated siblings.
+              let itemList = structured.slice();
+              if (c === ticketCreationChange && inferredInitialFields.length) {
+                const present = new Set(itemList.map(p => p.key.toLowerCase()));
+                inferredInitialFields.forEach(extra => {
+                  if (!present.has(extra.key.toLowerCase())) itemList.push(extra);
+                });
+                if (hasFieldFilter || lower) {
+                  itemList = itemList.filter(p => {
+                    const labelOk = !hasFieldFilter || selectedFields.has(p.key);
+                    if (!labelOk) return false;
+                    if (!lower) return true;
+                    return `${p.key} ${p.value}`.toLowerCase().includes(lower);
+                  });
+                }
+              }
+              const items = itemList.map(p => `
+                <div class="hu-audit-kv-row">
+                  <span class="hu-audit-kv-key">${escapeHtml(p.key)}</span>
+                  <span class="hu-audit-kv-val">${escapeHtml(p.value)}</span>
+                </div>
+              `).join('');
+              const inferredNote = (c === ticketCreationChange && inferredInitialFields.length && !hasFieldFilter && !lower)
+                ? '<div class="hu-audit-inferred-note">Inferred from later changes — fields that have audit rows.</div>'
+                : '';
+              return `<div class="hu-audit-change">${head}<div class="hu-audit-kv">${items}</div>${inferredNote}</div>`;
+            }
+
+            const bits = [];
+            if (c.fieldLabel) bits.push(`<strong>${escapeHtml(c.fieldLabel)}</strong>`);
+            if (c.oldV || c.newV) {
+              const oldHtml = c.oldV
+                ? `<span class="hu-audit-old">${escapeHtml(c.oldV)}</span>`
+                : '<span class="hu-audit-old hu-audit-empty">(empty)</span>';
+              const newHtml = c.newV
+                ? `<span class="hu-audit-new">${escapeHtml(c.newV)}</span>`
+                : '<span class="hu-audit-new hu-audit-empty">(empty)</span>';
+              bits.push(`${oldHtml} &rarr; ${newHtml}`);
+            }
+            // Skip the duplicate outcome chip when the outcome is already
+            // doing duty as the field label (Halo's creation rows).
+            if (c.outcome && !c.outcomeUsedAsLabel) {
+              bits.push(`<span class="hu-audit-outcome">${escapeHtml(c.outcome)}</span>`);
+            }
+            const body = bits.length
+              ? bits.join(' &nbsp;·&nbsp; ')
+              : '<em class="hu-audit-empty">No detail</em>';
+            return `<div class="hu-audit-change">${body}</div>`;
+          }).join('');
+
+          const tableLabel = tx.tableQual && !/^(faults?|fault)$/i.test(tx.tableQual)
+            ? ` <span class="hu-audit-table">on ${escapeHtml(tx.tableQual.toLowerCase())}</span>` : '';
+          const txMeta = tx.changes.length > 1
+            ? ` <span class="hu-audit-tx-count">${tx.changes.length} changes</span>`
+            : '';
+
+          const rowEl = document.createElement('div');
+          rowEl.className = 'hu-audit-row';
+          rowEl.innerHTML = `
+            <div class="hu-audit-head">
+              <span class="hu-audit-time">${escapeHtml(whenStr)}</span>
+              <span class="hu-audit-who">${escapeHtml(tx.who)}</span>
+              ${txMeta}${tableLabel}
+            </div>
+            <div class="hu-audit-detail">${changeLinesHtml}</div>
+          `;
+
+          list.appendChild(rowEl);
+        });
+
+        groupEl.appendChild(list);
+        listsHost.appendChild(groupEl);
+      });
+    }
+
+    render('');
+    const filterInput = document.getElementById('hu-audit-filter');
+    if (filterInput) {
+      let debounceTimer;
+      filterInput.addEventListener('input', () => {
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => render(filterInput.value), 60);
+      });
+      // Autofocus the filter so the user can start typing immediately.
+      setTimeout(() => filterInput.focus(), 80);
+    }
+  }
+
   function showRecentPanel() {
     injectStyles();
     closeDrawer('hu-json-drawer');
@@ -5472,6 +6810,70 @@ ${orderBy}
     openDrawer(drawer);
   }
 
+  // Catalog ships as content/api-catalog.json — generated from swagger.json.
+  // Lazy-loaded once per session; the file is web-accessible via the manifest.
+  let API_CATALOG = null;
+  let API_CATALOG_LOADING = null;
+
+  async function loadApiCatalog() {
+    if (API_CATALOG) return API_CATALOG;
+    if (API_CATALOG_LOADING) return API_CATALOG_LOADING;
+    API_CATALOG_LOADING = (async () => {
+      try {
+        const url = chrome.runtime.getURL('content/api-catalog.json');
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
+        API_CATALOG = data;
+        return data;
+      } catch (e) {
+        API_CATALOG_LOADING = null;
+        throw e;
+      }
+    })();
+    return API_CATALOG_LOADING;
+  }
+
+  function endpointMatchesFilter(ep, lower, methodFilters) {
+    if (methodFilters && methodFilters.size) {
+      const methods = (ep.m || '').split(/\s+/);
+      let any = false;
+      for (const m of methods) { if (methodFilters.has(m)) { any = true; break; } }
+      if (!any) return false;
+    }
+    if (!lower) return true;
+    if ((ep.p || '').toLowerCase().includes(lower)) return true;
+    if ((ep.s || '').toLowerCase().includes(lower)) return true;
+    if ((ep.t || '').toLowerCase().includes(lower)) return true;
+    if ((ep.c || '').toLowerCase().includes(lower)) return true;
+    // Param-name matching: helps users find endpoints by query-param.
+    if (Array.isArray(ep.params)) {
+      for (const p of ep.params) {
+        if (typeof p === 'string' && p.toLowerCase().includes(lower)) return true;
+      }
+    }
+    return false;
+  }
+
+  function buildApiParamsHtml(ep) {
+    if (!Array.isArray(ep.params) || ep.params.length === 0) {
+      return '<div class="hu-api-noparams">No documented parameters.</div>';
+    }
+    const pathParams = [];
+    const queryParams = [];
+    for (const p of ep.params) {
+      if (typeof p !== 'string') continue;
+      const [name, where] = p.split('|');
+      const html = `<code class="hu-api-param">${escapeHtml(name)}</code>`;
+      if (where === 'path') pathParams.push(html);
+      else queryParams.push(html);
+    }
+    const parts = [];
+    if (pathParams.length) parts.push(`<div class="hu-api-param-row"><span class="hu-api-param-label">Path</span>${pathParams.join(' ')}</div>`);
+    if (queryParams.length) parts.push(`<div class="hu-api-param-row"><span class="hu-api-param-label">Query</span>${queryParams.join(' ')}</div>`);
+    return parts.join('');
+  }
+
   function showApiReference() {
     injectStyles();
     closeDrawer('hu-json-drawer');
@@ -5482,33 +6884,126 @@ ${orderBy}
     const drawer = createDrawer('hu-api-drawer', 'Halo REST API reference');
     const body = drawer.querySelector('.hu-drawer-body');
 
-    API_RESOURCES.forEach(section => {
-      const heading = document.createElement('div');
-      heading.className = 'hu-row hu-section-row';
-      heading.innerHTML = `<span class="hu-section-label">${escapeHtml(section.category)}</span>`;
-      body.appendChild(heading);
+    // Toolbar: search input + method filter chips + count.
+    const toolbar = document.createElement('div');
+    toolbar.className = 'hu-api-toolbar';
+    toolbar.innerHTML = `
+      <input type="text" class="hu-api-search" placeholder="Search endpoints, params, or tags…" aria-label="Search API endpoints">
+      <div class="hu-api-methods" role="group" aria-label="Filter by HTTP method">
+        ${['GET','POST','PUT','DELETE','PATCH'].map(m => `<button type="button" class="hu-api-method-chip" data-method="${m}">${m}</button>`).join('')}
+      </div>
+      <div class="hu-api-count" aria-live="polite"></div>
+    `;
+    body.appendChild(toolbar);
 
-      section.endpoints.forEach(ep => {
-        const row = document.createElement('div');
-        row.className = 'hu-row hu-api-row';
-        row.innerHTML = `
-          <span class="hu-api-row-inner">
-            <span>
-              <span class="hu-row-title" style="font-family:monospace;font-size:12px">${escapeHtml(ep.path)}</span>
-              <span class="hu-row-sub">${escapeHtml(ep.desc)}</span>
-            </span>
-            <button class="hu-copy hu-method-badge" title="Copy path">${escapeHtml(ep.methods)}</button>
-          </span>
-        `;
-        const copyBtn = row.querySelector('.hu-method-badge');
-        copyBtn.addEventListener('click', () => {
-          navigator.clipboard?.writeText(ep.path).then(() => {
-            copyBtn.textContent = 'Copied!';
-            setTimeout(() => { copyBtn.textContent = ep.methods; }, 1500);
+    const resultsHost = document.createElement('div');
+    resultsHost.className = 'hu-api-results';
+    resultsHost.innerHTML = '<div class="hu-api-empty">Loading catalog…</div>';
+    body.appendChild(resultsHost);
+
+    const searchEl = toolbar.querySelector('.hu-api-search');
+    const methodBtns = toolbar.querySelectorAll('.hu-api-method-chip');
+    const countEl = toolbar.querySelector('.hu-api-count');
+    const methodFilters = new Set();
+
+    function renderList(catalog) {
+      const lower = searchEl.value.trim().toLowerCase();
+      const endpoints = catalog.endpoints || [];
+      const matched = endpoints.filter(ep => endpointMatchesFilter(ep, lower, methodFilters));
+      countEl.textContent = `${matched.length} of ${endpoints.length}`;
+
+      if (!matched.length) {
+        resultsHost.innerHTML = '<div class="hu-api-empty">No endpoints match.</div>';
+        return;
+      }
+      // Group by category, preserving the catalog's category order.
+      const groups = new Map();
+      for (const ep of matched) {
+        const key = ep.c || 'Other';
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(ep);
+      }
+      const orderedCats = (catalog.categories || []).filter(c => groups.has(c));
+      // Append any unexpected categories at the end.
+      for (const k of groups.keys()) { if (!orderedCats.includes(k)) orderedCats.push(k); }
+
+      const frag = document.createDocumentFragment();
+      orderedCats.forEach(cat => {
+        const heading = document.createElement('div');
+        heading.className = 'hu-row hu-section-row';
+        heading.innerHTML = `<span class="hu-section-label">${escapeHtml(cat)} <span class="hu-api-cat-count">${groups.get(cat).length}</span></span>`;
+        frag.appendChild(heading);
+
+        groups.get(cat).forEach(ep => {
+          const row = document.createElement('div');
+          row.className = 'hu-row hu-api-row hu-api-row-v2';
+          row.innerHTML = `
+            <div class="hu-api-row-head">
+              <button type="button" class="hu-api-toggle" aria-label="Toggle parameter detail">
+                <span class="hu-api-arrow">▸</span>
+                <code class="hu-api-path">${escapeHtml(ep.p)}</code>
+              </button>
+              <div class="hu-api-meta">
+                ${ep.s ? `<span class="hu-api-summary">${escapeHtml(ep.s)}</span>` : ''}
+                <span class="hu-api-methods-tag">${escapeHtml(ep.m || '')}</span>
+                <button class="hu-copy hu-api-copy" type="button" title="Copy path">Copy</button>
+              </div>
+            </div>
+            <div class="hu-api-detail" hidden></div>
+          `;
+
+          const toggle = row.querySelector('.hu-api-toggle');
+          const arrow  = row.querySelector('.hu-api-arrow');
+          const detail = row.querySelector('.hu-api-detail');
+          let loaded = false;
+          toggle.addEventListener('click', () => {
+            const open = !detail.hidden;
+            if (open) {
+              detail.hidden = true;
+              arrow.textContent = '▸';
+            } else {
+              if (!loaded) {
+                detail.innerHTML = buildApiParamsHtml(ep);
+                loaded = true;
+              }
+              detail.hidden = false;
+              arrow.textContent = '▾';
+            }
           });
+
+          const copyBtn = row.querySelector('.hu-api-copy');
+          copyBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            navigator.clipboard?.writeText(ep.p).then(() => {
+              const orig = copyBtn.textContent;
+              copyBtn.textContent = 'Copied!';
+              setTimeout(() => { copyBtn.textContent = orig; }, 1200);
+            });
+          });
+
+          frag.appendChild(row);
         });
-        body.appendChild(row);
       });
+
+      resultsHost.innerHTML = '';
+      resultsHost.appendChild(frag);
+    }
+
+    loadApiCatalog().then(catalog => {
+      renderList(catalog);
+      searchEl.addEventListener('input', () => renderList(catalog));
+      methodBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
+          const m = btn.dataset.method;
+          if (methodFilters.has(m)) { methodFilters.delete(m); btn.classList.remove('is-active'); }
+          else { methodFilters.add(m); btn.classList.add('is-active'); }
+          renderList(catalog);
+        });
+      });
+      // Focus the search so the user can type immediately.
+      setTimeout(() => searchEl.focus(), 50);
+    }).catch(err => {
+      resultsHost.innerHTML = `<div class="hu-api-empty">Could not load catalog: ${escapeHtml(String(err.message || err))}</div>`;
     });
 
     openDrawer(drawer);
@@ -5715,6 +7210,95 @@ ${orderBy}
     return el;
   }
 
+  // Popup notes attached to the requester / site / client. Halo's own UI
+  // surfaces them as modal dialogs on form open; we render them as
+  // banners at the top of Ticket 360 so the agent sees them without
+  // having to open the customer record. Field names match the AreaPopup
+  // swagger schema (note, date_created, displayhtml, displaymodal,
+  // dismissable, limitdaterange, startdate, enddate).
+  //
+  // Honouring Halo's flags:
+  //   • limitdaterange — filter notes outside their active window
+  //   • displayhtml    — render note body as HTML when true, escape otherwise
+  //   • displaymodal   — stronger "alert" styling, requires explicit ack
+  //   • dismissable    — show an X button; non-dismissable notes stay visible
+  function renderTicket360PopupNotes(notes) {
+    if (!Array.isArray(notes) || !notes.length) return null;
+    // Dismissed-this-session set (in-memory). Re-opening the 360 drawer
+    // re-fetches notes, but ones the agent already dismissed this
+    // session stay hidden.
+    if (!HU.dismissedPopupNotes) HU.dismissedPopupNotes = new Set();
+
+    const wrap = document.createElement('div');
+    wrap.className = 'hu-360-banners hu-360-popup-banners';
+
+    const now = Date.now();
+    const active = notes.filter(n => {
+      if (!n) return false;
+      if (n.id != null && HU.dismissedPopupNotes.has(n.id)) return false;
+      if (n.limitdaterange) {
+        const s = n.startdate ? parseHaloDate(n.startdate).getTime() : null;
+        const e = n.enddate   ? parseHaloDate(n.enddate).getTime()   : null;
+        if (s && s > now) return false;
+        if (e && e < now) return false;
+      }
+      return true;
+    });
+
+    active.slice(0, 4).forEach(note => {
+      const body = String(note?.note || note?.note_text || note?.text || '').trim();
+      if (!body) return;
+      const dateRaw = note?.date_created || note?.datecreated || note?.date || '';
+      const date = dateRaw ? formatDateTime(dateRaw) : '';
+      const scope = (() => {
+        if (note?.user_id   || note?.userid)   return 'this user';
+        if (note?.site_id   || note?.siteid)   return 'this site';
+        if (note?.client_id || note?.clientid) return 'this customer';
+        return 'this account';
+      })();
+
+      const isModal = note.displaymodal === true;
+      const isDismissable = note.dismissable === true;
+
+      const ban = document.createElement('div');
+      ban.className = 'hu-360-banner hu-360-banner-popupnote'
+                    + (isModal ? ' hu-360-banner-popupnote-modal' : '');
+
+      const bodyHtml = note.displayhtml === true ? body : escapeHtml(body);
+      const titlePrefix = isModal ? 'Important — ' : '';
+      const closeBtnHtml = isDismissable
+        ? '<button type="button" class="hu-360-popup-close" aria-label="Dismiss note" title="Dismiss for this session">×</button>'
+        : '';
+
+      ban.innerHTML =
+        '<svg class="hu-360-banner-icon" viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">' +
+          (isModal
+            ? '<path d="M8 2l6 11H2z"/><path d="M8 7v3M8 11.5v0.5"/>'
+            : '<path d="M3 3h10v8H6l-3 3z"/><path d="M5 6h6M5 8h4"/>') +
+        '</svg>' +
+        '<div class="hu-360-popup-content">' +
+          `<div class="hu-360-banner-text">${escapeHtml(titlePrefix)}Popup note about ${escapeHtml(scope)}</div>` +
+          `<div class="hu-360-popup-body">${bodyHtml}</div>` +
+          (date ? `<div class="hu-360-popup-meta">Added ${escapeHtml(date)}</div>` : '') +
+        '</div>' +
+        closeBtnHtml;
+
+      if (isDismissable) {
+        ban.querySelector('.hu-360-popup-close').addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          if (note.id != null) HU.dismissedPopupNotes.add(note.id);
+          ban.remove();
+          // If the wrapper is now empty, remove it so layout collapses cleanly.
+          if (!wrap.childElementCount) wrap.remove();
+        });
+      }
+
+      wrap.appendChild(ban);
+    });
+    return wrap.childElementCount ? wrap : null;
+  }
+
   // Aging + activity badges. Compact "open 3d · 7 actions · last touched 2h"
   // chip row that sits in the hero, gives the agent an instant temperature read.
   // SLA half-donut: single ring showing the most critical SLA. We rank
@@ -5907,17 +7491,16 @@ ${orderBy}
     }).join('');
 
     const centerIcon = slaStatusIconHtml(critical.noteState);
-    const centerLabel = critical.noteState === 'met'
-      ? (critical.note && critical.note !== 'Met' ? `${centerIcon}<span class="hu-360-sla-donut-center-text">${escapeHtml(critical.note)}</span>` : centerIcon)
-      : critical.noteState === 'breached'
-        ? `${centerIcon}<span class="hu-360-sla-donut-center-text">${escapeHtml(critical.note)}</span>`
-        : escapeHtml(critical.note);
+    const centerNoteText = critical.noteState === 'met'
+      ? (critical.note && critical.note !== 'Met' ? critical.note : '')
+      : critical.note || '';
 
     return `<div class="hu-360-sla-donut" title="${escapeHtml(tipParts.join('\n'))}">
       <svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" aria-hidden="true">
         ${segHtml}
       </svg>
-      <div class="hu-360-sla-donut-center ${critical.cls}">${centerLabel}</div>
+      ${centerIcon ? `<div class="hu-360-sla-donut-center-icon ${critical.cls}">${centerIcon}</div>` : ''}
+      ${centerNoteText ? `<div class="hu-360-sla-donut-center ${critical.cls}"><span class="hu-360-sla-donut-center-text">${escapeHtml(centerNoteText)}</span></div>` : ''}
     </div>`;
   }
 
@@ -5931,10 +7514,81 @@ ${orderBy}
     }
     if (actions?.length) badges.push(`${actions.length} action${actions.length === 1 ? '' : 's'}`);
     if (lastUpdate) badges.push(`Last touched ${timeAgo(lastUpdate)}`);
+
+    // Appointment chip — DD/MM/YYYY, HH.MM (24h). Sourced from
+    // includelastappointment / includenextappointment on /api/tickets/{id}.
+    // We use a fixed European format (not formatDateTime) because the date
+    // sits next to other compact aging chips and needs to be unambiguous.
+    const formatApptDate = (iso) => {
+      const d = parseHaloDate(iso);
+      if (!d || isNaN(d.getTime())) return '';
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}, ${pad(d.getHours())}.${pad(d.getMinutes())}`;
+    };
+    const nextAppt = ticket.next_appointment || ticket.nextappointment || ticket.nextAppointment;
+    const lastAppt = ticket.last_appointment || ticket.lastappointment || ticket.lastAppointment;
+    const apptToShow = (nextAppt && (nextAppt.start_date || nextAppt.startdate)) ? nextAppt
+                      : (lastAppt && (lastAppt.start_date || lastAppt.startdate)) ? lastAppt
+                      : null;
+    if (apptToShow) {
+      const when = formatApptDate(apptToShow.start_date || apptToShow.startdate);
+      if (when) badges.push('Appointment: ' + when);
+    }
+
     if (!badges.length) return '';
-    return `<div class="hu-360-aging">${badges.map(b =>
-      `<span class="hu-360-aging-chip">${escapeHtml(b)}</span>`
-    ).join('')}</div>`;
+    // Build chip with optional per-chip tooltip data (e.g. appointment subject).
+    const apptSubject = apptToShow
+      ? String(apptToShow.subject || apptToShow.summary || apptToShow.title || apptToShow.name || '').trim()
+      : '';
+    return `<div class="hu-360-aging" id="hu-360-aging-row">${badges.map(b => {
+      const isAppt = b.startsWith('Appointment:');
+      const titleAttr = isAppt && apptSubject ? ` title="${escapeHtml(apptSubject)}"` : '';
+      return `<span class="hu-360-aging-chip"${titleAttr}>${escapeHtml(b)}</span>`;
+    }).join('')}</div>`;
+  }
+
+  // Append a "Viewed N×" chip once /api/FaultViewLog resolves. Tooltip
+  // shows the most recent viewers with timestamps. Halo's swagger doesn't
+  // pin down the row schema, so we try a handful of plausible field names
+  // and fall back to looking up `agent_id` in `cache_agent`.
+  function viewerNameFromRow(row) {
+    const direct = row.agent_name || row.agentname || row.username || row.name
+                || row.who || row.agent || row.viewed_by_name || row.viewer_name;
+    if (direct) return String(direct);
+    const id = row.agent_id || row.agentid || row.viewer_id || row.viewed_by;
+    if (id) {
+      const cached = getCachedName('cache_agent', id);
+      if (cached) return cached;
+      return 'Agent #' + id;
+    }
+    return '';
+  }
+
+  function patchTicket360ViewLog(viewLogResp) {
+    const row = document.getElementById('hu-360-aging-row');
+    if (!row) return;
+    const rows = Array.isArray(viewLogResp) ? viewLogResp
+      : (viewLogResp?.faultsviewlog || viewLogResp?.faultviewlog
+         || viewLogResp?.viewlog || viewLogResp?.viewlogs
+         || viewLogResp?.items || []);
+    if (!rows.length) return;
+    const total = rows.length;
+    // Build a tooltip listing the last few viewers. Skip rows with no
+    // resolvable name — these add no information to the tooltip.
+    const recent = rows.slice(0, 6).map(r => {
+      const who = viewerNameFromRow(r);
+      const whenRaw = r.date || r.viewdate || r.datetime || r.when
+                   || r.when_viewed || r.date_viewed;
+      const when = whenRaw ? formatDateTime(whenRaw) : '';
+      if (!who && !when) return '';
+      return [who || 'Unknown agent', when].filter(Boolean).join(' — ');
+    }).filter(Boolean).join('\n');
+
+    const chip = document.createElement('span');
+    chip.className = 'hu-360-aging-chip hu-360-aging-viewed';
+    chip.textContent = total === 1 ? 'Viewed 1×' : `Viewed ${total}×`;
+    chip.title = recent || 'View log entries had no recognisable viewer field.';
+    row.appendChild(chip);
   }
 
   // Quick-action pill buttons.
@@ -5948,7 +7602,8 @@ ${orderBy}
       note: svg('<path d="M11.5 2.5l2 2L5 13H3v-2z"/><path d="M9 4l3 3"/>'),
       time: svg('<circle cx="8" cy="8" r="6"/><path d="M8 5v3l2 1.5"/>'),
       flag: svg('<path d="M3 14V2"/><path d="M3 3h9l-2 3 2 3H3"/>'),
-      link: svg('<path d="M7 9a3 3 0 0 0 4 0l2-2a3 3 0 0 0-4-4L8 4"/><path d="M9 7a3 3 0 0 0-4 0L3 9a3 3 0 0 0 4 4l1-1"/>')
+      link: svg('<path d="M7 9a3 3 0 0 0 4 0l2-2a3 3 0 0 0-4-4L8 4"/><path d="M9 7a3 3 0 0 0-4 0L3 9a3 3 0 0 0 4 4l1-1"/>'),
+      audit: svg('<path d="M2 4h12M2 8h12M2 12h12"/><circle cx="13" cy="4" r="1.6"/><circle cx="5" cy="8" r="1.6"/><circle cx="10" cy="12" r="1.6"/>')
     };
     const flagFill = flagged ? 'fill="currentColor"' : 'fill="none"';
     const flagIcon = `<svg viewBox="0 0 16 16" width="11" height="11" ${flagFill} stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 14V2"/><path d="M3 3h9l-2 3 2 3H3" ${flagFill}/></svg>`;
@@ -6080,8 +7735,10 @@ ${orderBy}
     const placeholderTotal = 5;
     const segmentsHtml = (count, cur, names) => Array.from({ length: count }).map((_, i) => {
       const cls = i < cur - 1 ? 'is-on' : i === cur - 1 ? 'is-current' : '';
-      const title = names && names[i] ? `title="${escapeHtml(names[i])}"` : '';
-      return `<div class="hu-360-wf-seg ${cls}" ${title}></div>`;
+      const name = names && names[i] ? String(names[i]) : '';
+      const title = name ? `title="${escapeHtml(name)}"` : '';
+      const labelHtml = name ? `<span class="hu-360-wf-seg-label">${escapeHtml(name)}</span>` : '';
+      return `<div class="hu-360-wf-seg ${cls}" ${title}>${labelHtml}</div>`;
     }).join('');
 
     const sec = document.createElement('section');
@@ -6156,15 +7813,18 @@ ${orderBy}
     return sec;
   }
 
-  // Short "2d 4h" / "45m" / "30s" formatter for SLA bar notes.
+  // Short "2d" / "24h" / "45m" / "30s" formatter for SLA bar notes. Uses
+  // round (not floor) on the hour/day boundary so a 23h 59m remainder reads
+  // as "24h" rather than "23h" — closer to what a human reading the SLA
+  // expects to see at the 1-day-out mark.
   function formatDurationShort(ms) {
     if (!Number.isFinite(ms) || ms < 0) return '0s';
     if (ms < 60000) return `${Math.max(1, Math.round(ms / 1000))}s`;
-    const mins = Math.floor(ms / 60000);
+    const mins = Math.round(ms / 60000);
     if (mins < 60) return `${mins}m`;
-    const hours = Math.floor(mins / 60);
+    const hours = Math.round(mins / 60);
     if (hours < 48) return `${hours}h`;
-    return `${Math.floor(hours / 24)}d`;
+    return `${Math.round(hours / 24)}d`;
   }
 
   // SLA status icon — green check for met-on-time, red cross for breached
@@ -6324,6 +7984,29 @@ ${orderBy}
     addGroup('Children', children, t => new URL(`/tickets?id=${t.id}`, window.location.origin).href);
     addGroup('Open tickets from this user', userTickets, t => new URL(`/tickets?id=${t.id}`, window.location.origin).href);
     addGroup('Linked assets', assets, a => new URL(`/assets?id=${a.id}`, window.location.origin).href);
+
+    // Cross-entity linked objects (changes, problems, releases, opportunities)
+    // come from the `includelinkedobjects=true` query param. Halo flattens
+    // them onto the ticket as `linked_objects` — an array of typed records
+    // with `id`, `objecttype`, and `summary`.
+    const linkedObjects = Array.isArray(ticket.linked_objects) ? ticket.linked_objects
+      : Array.isArray(ticket.linkedobjects) ? ticket.linkedobjects : [];
+    if (linkedObjects.length) {
+      // Group by object type so the section reads cleanly with multiple
+      // kinds of links (e.g. one change + two problems).
+      const byType = {};
+      linkedObjects.forEach(lo => {
+        const t = String(lo?.objecttype || lo?.type || 'Related').trim() || 'Related';
+        if (!byType[t]) byType[t] = [];
+        byType[t].push(lo);
+      });
+      Object.entries(byType).forEach(([typeName, items]) => {
+        addGroup(typeName, items.map(it => ({
+          id: it.id,
+          summary: it.summary || it.name || ('#' + it.id)
+        })), it => new URL(`/tickets?id=${it.id}`, window.location.origin).href);
+      });
+    }
 
     // If every group was skipped (filtered to empty by addGroup), drop the
     // section so the user doesn't see a header with no content.
@@ -7263,10 +8946,16 @@ ${orderBy}
       // it up when the user comes back.
       if (document.hidden) return;
       try {
+        // Minimal fetch — only need last_update to decide whether to refresh.
+        // Doesn't go through loadTicketRecord on purpose: we want fresh data
+        // and don't want every poll to thrash the cache.
         const fresh = await haloApiRequest(`/api/tickets/${ticketId}`);
         const lu = fresh && (fresh.last_update || fresh.lastactiondate || '');
         if (lu && lu !== HU._ticket360LastSeen) {
           HU._ticket360LastSeen = lu;
+          // Invalidate the shared cache so the re-render below refetches the
+          // full ticket. /f will also see the new data on next activation.
+          delete HU.ticketRecordPromises[String(ticketId)];
           openTicket360Panel().catch(() => {});
         }
       } catch (_) {}
@@ -7455,12 +9144,62 @@ ${orderBy}
       // agent's ticket-view permission (works for non-admins who can see the
       // ticket in Halo's own UI). /api/Report-based queries used to fail with
       // 403 for non-admin agents even when they could see the ticket itself.
+      //
+      // loadTicketRecord shares the per-session cache with /f, so opening
+      // Ticket 360 right after /f (or vice versa) on the same ticket is free.
+      // Polling below invalidates this cache when it detects a real update.
       const [ticket, actionsResp] = await Promise.all([
-        haloApiRequest(`/api/tickets/${ticketId}`),
+        loadTicketRecord(ticketId),
         haloApiRequest(`/api/actions?ticket_id=${ticketId}&count=25`).catch(() => ({ actions: [] }))
       ]);
+      if (!ticket) throw new Error('ticket fetch failed');
 
       const actionRows = extractEntityList(actionsResp, 'actions');
+
+      // Fire popup notes + view log in parallel, scoped to the people on
+      // this ticket. Both are best-effort — empty arrays are valid responses.
+      // We don't await these inline because the rest of the render shouldn't
+      // wait on them; they patch in once they resolve.
+      const userId   = ticket.user_id   || ticket.user?.id   || 0;
+      const siteId   = ticket.site_id   || ticket.site?.id   || 0;
+      const clientId = ticket.client_id || ticket.client?.id || 0;
+      // Halo's /api/PopupNote ANDs its scoping parameters: passing user_id
+      // AND site_id AND client_id only returns notes attached to ALL three
+      // simultaneously, which almost never matches. Halo's own UI calls
+      // the endpoint per entity and merges. We do the same.
+      const fetchPopupScope = (key, id) => {
+        if (!id) return Promise.resolve(null);
+        const url = `/api/PopupNote?${key}=${encodeURIComponent(id)}&showall=true`;
+        return haloApiRequest(url)
+          .then(resp => ({ resp, scopeKey: key, scopeId: id }))
+          .catch(() => null);
+      };
+      const popupNotesPromise = Promise.all([
+        fetchPopupScope('user_id',   userId),
+        fetchPopupScope('site_id',   siteId),
+        fetchPopupScope('client_id', clientId)
+      ]).then(results => {
+        // Merge results, deduping by note id when present.
+        const seen = new Set();
+        const merged = [];
+        const unwrap = (resp) => Array.isArray(resp) ? resp
+          : (resp?.popupnotes || resp?.popup_notes || resp?.areapopups
+             || resp?.area_popups || resp?.notes || resp?.items || []);
+        results.forEach(r => {
+          if (!r) return;
+          unwrap(r.resp).forEach(note => {
+            if (!note) return;
+            const id = note.id;
+            if (id != null) {
+              if (seen.has(id)) return;
+              seen.add(id);
+            }
+            merged.push(note);
+          });
+        });
+        return merged;
+      });
+      const viewLogPromise = haloApiRequest(`/api/FaultViewLog?ticket_id=${ticketId}`).catch(() => null);
 
       // Kick off live-update listeners (poll + visibilitychange) so the panel
       // reflects changes made from Halo's own UI or another tab.
@@ -7562,6 +9301,25 @@ ${orderBy}
       // Banner sits at the very top, in normal flow (under the header, above hero).
       const banner = renderTicket360Banners(ticket);
       if (banner) wrap.appendChild(banner);
+
+      // Popup-notes banner anchor — filled asynchronously when the
+      // /api/PopupNote response resolves. We mount the placeholder so
+      // late-arriving notes don't reshuffle later sections.
+      const popupHost = document.createElement('div');
+      popupHost.id = 'hu-360-popup-host';
+      wrap.appendChild(popupHost);
+      popupNotesPromise.then(notes => {
+        const popupBanners = renderTicket360PopupNotes(notes || []);
+        if (popupBanners) popupHost.replaceWith(popupBanners);
+        else popupHost.remove();
+      }).catch(() => popupHost.remove());
+
+      // FaultViewLog appends a "Viewed N×" chip onto the aging row in the
+      // hero. Fire-and-forget; chip just doesn't appear if the endpoint
+      // 403s or returns empty.
+      viewLogPromise.then(viewLogResp => {
+        if (viewLogResp) patchTicket360ViewLog(viewLogResp);
+      }).catch(() => {});
 
       // Priority chip — prefer Halo's per-tenant colour from cache_priority
       // (matches the configured palette in Settings → Priorities). Falls back
@@ -8010,6 +9768,14 @@ ${orderBy}
         wrap.appendChild(traceCard);
       }
 
+      // Subtle footer link — fetches and renders the full audit trail on
+      // demand (separate from the cached ticket fetch since it's heavy).
+      const auditFoot = document.createElement('div');
+      auditFoot.className = 'hu-360-footer';
+      auditFoot.innerHTML = `<button type="button" class="hu-360-foot-link" data-action="audit">View audit log &rarr;</button>`;
+      auditFoot.querySelector('.hu-360-foot-link').addEventListener('click', () => openAuditLogDrawer(ticket.id));
+      wrap.appendChild(auditFoot);
+
       // wrap === body in v3 — sections were appended directly.
       // Restore scroll position so an in-place refresh doesn't jump to top.
       if (isInPlace && preservedScrollTop) body.scrollTop = preservedScrollTop;
@@ -8354,22 +10120,796 @@ ${orderBy}
     toast('Field API names shown');
   }
 
-  function revealFieldNames() {
+  async function revealFieldNames() {
     if (!HU.fieldOverlayOn) return;
     document.querySelectorAll('.hu-field-tag').forEach(tag => tag.remove());
     const labels = document.querySelectorAll('label, .field-label, [class*="field-label"], [class*="form-label"]');
 
+    // On user / asset / customer / supplier / site forms the `other1..N`,
+    // `inv1..N` and `userdef1..N` slots are tenant-relabelable via Halo's
+    // language pack (`/api/Languages/{id}`). When that map is available it's
+    // a deterministic lookup. If it isn't yet (first-ever activation before
+    // the 8 MB fetch returns) or the call is forbidden, we fall back to
+    // value-matching. The pack load is kicked off in initNavigationTracking,
+    // so by the time the user hits `f` it's typically already cached.
+    const slotCtx = detectSlotRecordContext();
+    const cfCtx = detectCustomFieldContext();
+    const slotEntity = slotCtx ? slotCtx.type.toLowerCase() : null;
+    const cfEntity = cfCtx ? cfCtx.type.toLowerCase() : null;
+
+    if (cfEntity) loadCustomFieldMap(cfEntity); // fire-and-forget; populates HU.customFieldMap[cfEntity]
+    const labelToSlot = (slotEntity && HU.slotLabelMap) ? HU.slotLabelMap[slotEntity] : null;
+    const labelToCustomField = cfEntity ? HU.customFieldMap[cfEntity] : null;
+
+    let slotMap = null;
+    if (slotEntity && !labelToSlot) {
+      const slotRecord = await getSlotRecordSafely();
+      slotMap = slotRecord ? buildSlotValueMap(slotRecord) : null;
+      if (!HU.fieldOverlayOn) return;
+    }
+
+    // Ticket forms only: load the live ticket record. Used for value-matching
+    // when the DOM doesn't carry a `for` binding, and for runtime validation
+    // so a parsed-but-wrong name produces no tag (silent miss) instead of a
+    // false tag (silent lie). One fetch, cached per session — used to be 4
+    // (ticket + user + site + client) when we still produced cross-entity
+    // dot-paths; now that DOM parsing always returns the ticket's own field,
+    // the related-entity expansion was dead weight and got dropped.
+    let ticketRecord = null;
+    let ticketValueMap = null;
+    if (cfCtx && cfCtx.type === 'Ticket') {
+      ticketRecord = await loadTicketRecord(cfCtx.id);
+      if (!HU.fieldOverlayOn) return;
+      ticketValueMap = buildTicketValueMap(ticketRecord);
+    }
+
     labels.forEach(label => {
       if (isTableCheckboxLabel(label)) return;
-      const apiName = getFieldApiName(label);
+      const labelSlug = labelTextToAutoSlug(label);
+      // Collection widgets / section headers — see SKIP_LABEL_SLUGS comment.
+      if (SKIP_LABEL_SLUGS.has(labelSlug)) return;
+
+      // `getFieldApiName` now parses the canonical name straight out of
+      // Halo's `<label for="input-field-for-XXX">` attribute — see comment
+      // there. That's the dynamic primary signal and works on read-only
+      // forms too. Everything below is fallback for the rare cases where
+      // the DOM doesn't carry the binding.
+      let apiName = getFieldApiName(label, ticketRecord);
+      const isAutoSlugged = !apiName || apiName === labelSlug;
+
+      // Custom field fallback — when DOM didn't yield a name, look the
+      // label up in the live FieldInfo CF map.
+      if (labelToCustomField && isAutoSlugged) {
+        const cf = lookupSlotByLabelText(label, labelToCustomField);
+        if (cf) apiName = cf;
+      }
+
+      // Slot-relabel fallback — language pack tells us the tenant's
+      // relabel of other1/inv1/userdef1 slots.
+      if (labelToSlot) {
+        const slot = lookupSlotByLabelText(label, labelToSlot);
+        if (slot) apiName = slot;
+      } else if (slotMap) {
+        const slot = resolveSlotForLabel(label, slotMap);
+        if (slot) apiName = slot;
+      }
+
+      // Last resort: value-match the visible input value against the ticket
+      // record's own scalars. Bridges "label without `for`" cases — picks
+      // the field whose value is uniquely shown next to this label.
+      if (ticketValueMap) {
+        const stillAutoSlugged = !apiName || apiName === labelSlug;
+        if (stillAutoSlugged) {
+          const path = resolveDotPathForLabel(label, ticketValueMap);
+          if (path) apiName = path;
+        }
+      }
+
+      // Targeted validation: ONLY suppress when the name is the bare
+      // auto-slug of the label text. That's the "nothing else worked"
+      // fallback path — showing it would be a guess, not a binding.
+      //
+      // Names that came from a `for` attribute, the CF/slot maps, or the
+      // value-matcher are trusted and shown unconditionally. Halo's API
+      // omits empty fields from `/api/tickets/{id}` responses, so a strict
+      // `path in record` check would drop legitimate fields (e.g. an empty
+      // `phonenumber`). The parser already uses the record for candidate
+      // disambiguation, not as a strict gate.
+      if (apiName && apiName === labelSlug && ticketRecord) {
+        if (pathExistsInRecord(ticketRecord, apiName) === false) return;
+      }
+
       if (!apiName) return;
-      const tag = document.createElement('span');
-      tag.className = 'hu-field-tag';
-      tag.textContent = apiName;
-      label.appendChild(tag);
+      label.appendChild(buildFieldTag(apiName));
     });
 
     revealTableColumnNames();
+  }
+
+  // A bare name (e.g. `summary`) renders as the standard blue tag. A
+  // dot-pathed name (e.g. `user.emailaddress`) renders as the amber
+  // related-entity tag with the table prefix emphasised — so the user
+  // immediately sees that the field lives in a different table and an
+  // API call / SQL query needs to join through it.
+  function buildFieldTag(apiName) {
+    const tag = document.createElement('span');
+    tag.className = 'hu-field-tag';
+    tag.title = `Copy "${apiName}" to clipboard`;
+    tag.addEventListener('click', (e) => {
+      // Stop the click from reaching Halo's own label/form handlers
+      // (clicking a field label often triggers focus / enter-edit-mode).
+      e.preventDefault();
+      e.stopPropagation();
+      if (!navigator.clipboard) return;
+      navigator.clipboard.writeText(apiName).then(() => {
+        tag.classList.add('hu-field-tag-copied');
+        const originalText = tag.dataset.originalText;
+        if (!originalText) tag.dataset.originalText = tag.textContent;
+        // Remember the inner children if we have the dot-pathed shape, so
+        // the swap-back restores them rather than collapsing to a flat
+        // textContent.
+        const innerHTML = tag.innerHTML;
+        tag.textContent = 'Copied';
+        setTimeout(() => {
+          tag.classList.remove('hu-field-tag-copied');
+          tag.innerHTML = innerHTML;
+        }, 900);
+      }).catch(() => {});
+    });
+    const dotIndex = apiName.indexOf('.');
+    if (dotIndex > 0 && dotIndex < apiName.length - 1) {
+      tag.classList.add('hu-field-tag-related');
+      const entity = document.createElement('span');
+      entity.className = 'hu-field-tag-entity';
+      entity.textContent = apiName.slice(0, dotIndex);
+      const sep = document.createElement('span');
+      sep.className = 'hu-field-tag-sep';
+      sep.textContent = '.';
+      const field = document.createElement('span');
+      field.textContent = apiName.slice(dotIndex + 1);
+      tag.appendChild(entity);
+      tag.appendChild(sep);
+      tag.appendChild(field);
+    } else {
+      tag.textContent = apiName;
+    }
+    return tag;
+  }
+
+  function lookupSlotByLabelText(label, labelToSlot) {
+    const raw = (label.textContent || '').trim();
+    if (!raw) return null;
+    // Strip the asterisk required-marker and trailing colon Halo sometimes
+    // adds, plus our own tag's trailing space.
+    const cleaned = raw.replace(/\s*\*\s*$/, '').replace(/:\s*$/, '').trim().toLowerCase();
+    return labelToSlot[cleaned] || labelToSlot[raw.toLowerCase()] || null;
+  }
+
+  // Mirror of the auto-slug fallback inside getFieldApiName(): Halo's React
+  // app stamps `<input id="<labelSlug>" name="<labelSlug>">` for custom-field
+  // inputs, so a DOM attribute matching this slug is the auto-generated one.
+  // Standard fields have explicit names like "emailaddress" that don't match.
+  function labelTextToAutoSlug(label) {
+    const raw = (label.textContent || '').trim();
+    if (!raw) return '';
+    const cleaned = raw.replace(/\s*\*\s*$/, '').replace(/:\s*$/, '').trim();
+    return cleaned.replace(/[^a-z0-9]+/gi, '_').replace(/^_+|_+$/g, '').toLowerCase();
+  }
+
+  // ----- Language-pack-based slot resolver -----
+  // /api/Languages/{langId}?includedetails=true&includelanguagecontext=true
+  // returns entries like
+  //   { description: "Screen Label for User Other 1 Field",
+  //     default_string: "Other 1", translation: "Department",
+  //     iscustomised: true, ... }
+  // We walk the response once, regex the description to (entity, slotFamily,
+  // slotIndex), and build { entityKey: { displayLabel: slotName } }.
+  // The pack is ~8 MB, but the extract is ~30 entries — we cache the
+  // extracted map in chrome.storage.local indefinitely (per language).
+  // Inside the same session it's also held in HU.slotLabelMap.
+
+  function loadSlotLabelMap() {
+    if (HU.slotLabelMap) return Promise.resolve(HU.slotLabelMap);
+    if (HU.slotLabelMapPromise) return HU.slotLabelMapPromise;
+
+    HU.slotLabelMapPromise = (async () => {
+      const langId = 1;
+      const storageKey = `huSlotLabels_v3_${langId}`;
+      try {
+        const stored = await new Promise(r => chrome.storage.local.get(storageKey, r));
+        const cached = stored && stored[storageKey];
+        if (cached && cached.entries && typeof cached.entries === 'object') {
+          HU.slotLabelMap = cached.entries;
+          return cached.entries;
+        }
+      } catch (_) {}
+
+      try {
+        const pack = await haloApiRequest(
+          `/api/Languages/${langId}?includedetails=true&includelanguagecontext=true`
+        );
+        const entries = extractSlotLabelMap(pack);
+        HU.slotLabelMap = entries;
+        try {
+          chrome.storage.local.set({
+            [storageKey]: { entries, fetchedAt: Date.now() }
+          });
+        } catch (_) {}
+        return entries;
+      } catch (_) {
+        // Permission denied / network — fall back forever for this session.
+        HU.slotLabelMap = {};
+        return {};
+      }
+    })();
+
+    return HU.slotLabelMapPromise;
+  }
+
+  function extractSlotLabelMap(pack) {
+    const slotPattern = /Screen Label for (User|Site|Customer|Client|Asset|Supplier)\s+(Other|Inv|Userdef)\s*(\d+)\s+Field/i;
+    const out = {};
+
+    // For a matched node: register both the tenant's `translation` (preferred,
+    // wins over default) and the `default_string` as keys pointing at the
+    // canonical field name. Translation comes first so tenant relabels are
+    // resolved, and the default is the fallback for never-relabeled entries.
+    const recordLabel = (entity, canonical, node) => {
+      if (!entity || !canonical) return;
+      if (!out[entity]) out[entity] = {};
+      if (typeof node.translation === 'string') {
+        const t = node.translation.trim().toLowerCase();
+        if (t) out[entity][t] = canonical;
+      }
+      if (typeof node.default_string === 'string') {
+        const d = node.default_string.trim().toLowerCase();
+        if (d && !out[entity][d]) out[entity][d] = canonical;
+      }
+    };
+
+    const visit = (node) => {
+      if (Array.isArray(node)) { node.forEach(visit); return; }
+      if (!node || typeof node !== 'object') return;
+      const desc = node.description;
+      if (typeof desc === 'string') {
+        // Tenant-relabelable slot fields (other1/inv1/userdef1).
+        const m = desc.match(slotPattern);
+        if (m) {
+          const ent = m[1].toLowerCase() === 'client' ? 'customer' : m[1].toLowerCase();
+          const slot = `${m[2].toLowerCase()}${m[3]}`;
+          recordLabel(ent, slot, node);
+        }
+      }
+      for (const v of Object.values(node)) visit(v);
+    };
+    visit(pack);
+    return out;
+  }
+
+  // ----- Custom field label → canonical name resolver -----
+  // /api/FieldInfo?iscustomfieldsetup=true&typeid={n} returns the tenant's
+  // custom-field definitions for a given entity. The `name` property is the
+  // canonical name used in API PATCHes (e.g. "CFLastTicket"); the `label`
+  // is the friendly text shown on the form. Halo's React app stamps a
+  // separate auto-slugged id ("last_ticket") onto the DOM input, which is
+  // what getFieldApiName picks up — so we override it here.
+  // Responses are small (one entry per custom field); we cache per entity.
+
+  const ENTITY_TYPE_ID = {
+    user:     4,
+    customer: 2,
+    site:     3,
+    asset:    5,
+    supplier: 6,
+    ticket:   1
+  };
+
+  // Labels on a parent entity's form that actually belong to a *related* entity
+  // (e.g. on a ticket form, "Email Address" is the requester's `user.emailaddress`,
+  // not a ticket field). Keys are the auto-slugged label form (matches
+  // `labelTextToAutoSlug()`); values are the dot-walked tag we want to show.
+  // These take precedence over custom-field and slot lookups so a tenant CF
+  // whose label is "Email Address" doesn't mask the user's standard column.
+  //
+  // Only true cross-table fields belong here. Own-entity fields (e.g. `site_id`,
+  // `client_id`, `user_id` on a ticket) are handled by the value-matching
+  // fallback or the DOM lookup, and should NOT be hardcoded with a redundant
+  // `ticket.` prefix — the dot-path styling is reserved for related tables.
+  // Labels that name a collection widget / section header rather than a
+  // single field. `/f` is meant to give you something you can drop into an
+  // API call or SQL query — surfacing an auto-slug (e.g. `user_s_assets` for
+  // "User's Assets") would mislead, so we skip these outright. Keys are the
+  // auto-slugged label form (matches `labelTextToAutoSlug()`).
+  const SKIP_LABEL_SLUGS = new Set([
+    'user_s_assets',  // ticket sidebar — requester's asset list
+    'users_assets',
+    'user_assets'
+  ]);
+
+  // Returns the full FieldInfo array for an entity (not just label→name).
+  // Used by the side-panel schema explorer to surface CFs with their type,
+  // hint, variable_name, etc. — richer data than loadCustomFieldMap needs.
+  async function loadCustomFieldsRaw(entityKey) {
+    const typeid = ENTITY_TYPE_ID[entityKey];
+    if (typeid == null) return [];
+    try {
+      const resp = await haloApiRequest(
+        `/api/FieldInfo?iscustomfieldsetup=true&access_control_level=2&isconfig=true&typeid=${typeid}`
+      );
+      const arr = Array.isArray(resp) ? resp : (resp?.fields || resp?.fieldinfos || resp?.items || []);
+      // Strip fat properties Halo includes that we don't need for the
+      // explorer — keeps the payload small for chrome.storage.local.
+      return arr
+        .filter(f => f && typeof f === 'object' && typeof f.name === 'string' && f.name.trim())
+        .map(f => ({
+          name: String(f.name).trim(),
+          label: typeof f.label === 'string' ? f.label.trim() : '',
+          labellong: typeof f.labellong === 'string' ? f.labellong.trim() : '',
+          hint: typeof f.hint === 'string' ? f.hint.trim() : '',
+          type: typeof f.type === 'number' ? f.type : null,
+          inputtype: typeof f.inputtype === 'number' ? f.inputtype : null,
+          mandatory: !!f.mandatory,
+          variable_name: typeof f.variable_name === 'string' ? f.variable_name.trim() : '',
+          tab_name: typeof f.tab_name === 'string' ? f.tab_name.trim() : '',
+          groupname: typeof f.groupname === 'string' ? f.groupname.trim() : '',
+          // Trimmed picklist values — cap at 100 entries so a runaway
+          // database-lookup CF can't bloat chrome.storage.local. Show only
+          // `id` + `name`, drop sequence/colour/etc.
+          values: Array.isArray(f.values)
+            ? f.values
+                .filter(v => v && typeof v === 'object')
+                .slice(0, 100)
+                .map(v => ({
+                  id: v.id ?? v.value ?? null,
+                  name: typeof v.name === 'string' ? v.name : (typeof v.value === 'string' ? v.value : String(v.name ?? v.value ?? '')).trim()
+                }))
+                .filter(v => v.name)
+            : [],
+          // Tickettype bindings — which request types include this CF.
+          tickettypes: Array.isArray(f.tickettypes)
+            ? f.tickettypes
+                .filter(t => t && typeof t === 'object')
+                .map(t => ({
+                  id: t.id ?? null,
+                  name: typeof t.name === 'string' ? t.name.trim() : ''
+                }))
+                .filter(t => t.name)
+            : []
+        }));
+    } catch (_) {
+      return [];
+    }
+  }
+
+  // Harvest top-level field names from a sample record per entity. Bridges
+  // the SQL-vs-API naming gap in the schema explorer — the bundled
+  // tables.json uses SQL column names (PascalCase, legacy spellings like
+  // `DateOccured`, `FFlowID`); this exposes the API names (`workflow_id`,
+  // `dateoccurred`, etc.) too, so the side panel's schema search can find
+  // either form.
+  async function loadEntitySamples() {
+    const fetchers = {
+      ticket:   () => haloApiRequest('/api/tickets?count=1'),
+      user:     () => haloApiRequest('/api/users?count=1'),
+      customer: () => haloApiRequest('/api/client?count=1'),
+      site:     () => haloApiRequest('/api/site?count=1'),
+      asset:    () => haloApiRequest('/api/asset?count=1'),
+      supplier: () => haloApiRequest('/api/supplier?count=1'),
+      agent:    () => haloApiRequest('/api/agent?count=1')
+    };
+    const entries = Object.entries(fetchers);
+    const results = await Promise.all(entries.map(async ([entity, fetcher]) => {
+      try {
+        const resp = await fetcher();
+        // List endpoints return varied shapes — { record_count, items[] },
+        // a bare array, or { entityName: [...] }. Walk known shapes.
+        const arr = Array.isArray(resp) ? resp
+          : (resp?.tickets || resp?.users || resp?.clients || resp?.sites
+             || resp?.assets || resp?.suppliers || resp?.agents
+             || resp?.items || []);
+        const sample = arr[0];
+        if (!sample || typeof sample !== 'object') return [entity, []];
+        return [entity, Object.keys(sample)];
+      } catch (_) {
+        return [entity, []];
+      }
+    }));
+    return Object.fromEntries(results);
+  }
+
+  // ViewColumns harvest — Halo's saved column views carry both the API
+  // field name (column_name) and the friendly label users see in list
+  // grids (column_title_override). Crossing this against the schema
+  // explorer's existing rows is the closest we can get to a server-side
+  // SQL↔API label map without parsing the React bundle.
+  // Halo's /api/ViewColumns returns ALL view definitions in one call —
+  // the `?type=` filter is server-side ignored on the tenants we've seen.
+  // Each view's `type` field is the numeric "view group" code (NOT the
+  // FieldInfo typeid). Empirical mapping based on a live response:
+  //   0   = Tickets        4 = Customers
+  //   1   = Opportunities  5 = Sites
+  //   3   = Assets         6 = Users
+  // (103 = Changes, 107 = Projects, 112 = My Work — not yet mapped here.)
+  //
+  // First value is the string used in Halo's own UI call (kept for the
+  // query param); second is the numeric type code we filter by on the
+  // response. Either suffices because the API ignores `type=` anyway.
+  const VIEW_COLUMN_ENTITY_TYPES = {
+    ticket:   { queryType: 'reqs',     typeCode: 0 },
+    customer: { queryType: 'clients',  typeCode: 4 },
+    site:     { queryType: 'sites',    typeCode: 5 },
+    user:     { queryType: 'users',    typeCode: 6 },
+    asset:    { queryType: 'assets',   typeCode: 3 },
+    supplier: { queryType: 'suppliers',typeCode: null }
+  };
+
+  // Single shared fetch: hits /api/ViewColumns once (Halo ignores the
+  // `type=` query so we get every view in one round trip), filters
+  // client-side by numeric `type` code, then for any view that lacks an
+  // inline `columns` array, fetches the detail endpoint.
+  async function loadViewColumnsForType(typeCode, queryType) {
+    if (typeCode == null) return [];
+    // List fetch — same params Halo's own UI uses.
+    const listUrl = `/api/ViewColumns?showall=true&access_control_level=2&isconfig=true&type=${encodeURIComponent(queryType || '')}`;
+    const resp = await haloApiRequest(listUrl);
+    const all = Array.isArray(resp) ? resp : (resp?.viewcolumns || resp?.items || []);
+    const matched = all.filter(v => Number(v?.type) === Number(typeCode));
+    // Some views ship without an embedded columns array — fetch each
+    // missing one with includedetails to retrieve its columns.
+    await Promise.all(matched.map(async v => {
+      if (Array.isArray(v.columns) && v.columns.length) return;
+      try {
+        const detail = await haloApiRequest(`/api/ViewColumns/${v.id}?includedetails=true`);
+        if (detail && Array.isArray(detail.columns)) v.columns = detail.columns;
+      } catch (_) {}
+    }));
+    return matched;
+  }
+
+  async function loadViewColumnLabels() {
+    const entries = Object.entries(VIEW_COLUMN_ENTITY_TYPES);
+    const results = await Promise.all(entries.map(async ([entity, cfg]) => {
+      try {
+        const views = await loadViewColumnsForType(cfg.typeCode, cfg.queryType);
+        const labels = {};
+        for (const view of views) {
+          const cols = Array.isArray(view?.columns) ? view.columns : [];
+          for (const c of cols) {
+            const name = typeof c?.column_name === 'string' ? c.column_name.trim() : '';
+            const override = typeof c?.column_title_override === 'string' ? c.column_title_override.trim() : '';
+            if (!name) continue;
+            if (override && !labels[name]) labels[name] = override;
+            if (!override && !(name in labels)) labels[name] = '';
+          }
+        }
+        return [entity, labels];
+      } catch (_) {
+        return [entity, {}];
+      }
+    }));
+    return Object.fromEntries(results);
+  }
+
+  // Per-table column profiles — Halo lets users define column sets ("views")
+  // per entity. Each profile picks a subset of columns to display in the
+  // list grid. The Data Viewer can offer these as preset column layouts so
+  // the user sees the same columns they would in Halo's own list view.
+  // Cached per-entity for the session.
+  async function loadColumnProfilesForEntity(entity) {
+    const cfg = VIEW_COLUMN_ENTITY_TYPES[entity];
+    if (!cfg || cfg.typeCode == null) return [];
+    if (!HU.viewColumnProfileCache) HU.viewColumnProfileCache = {};
+    if (HU.viewColumnProfileCache[entity]) return HU.viewColumnProfileCache[entity];
+    try {
+      const views = await loadViewColumnsForType(cfg.typeCode, cfg.queryType);
+      const profiles = views.map(view => {
+        const cols = Array.isArray(view?.columns) ? view.columns : [];
+        return {
+          id: view?.id,
+          name: String(view?.name || 'Unnamed view').trim() || 'Unnamed view',
+          type: view?.type,
+          type_name: view?.type_name || '',
+          columns: cols.map(c => ({
+            name: String(c?.column_name || '').trim(),
+            label: String(c?.column_title_override || '').trim(),
+            width: c?.width || 0,
+            order: c?.column_seq || 0
+          })).filter(c => c.name)
+        };
+      }).filter(p => p.columns.length);
+      HU.viewColumnProfileCache[entity] = profiles;
+      return profiles;
+    } catch (_) {
+      HU.viewColumnProfileCache[entity] = [];
+      return [];
+    }
+  }
+
+  async function loadAllCustomFields() {
+    const entities = Object.keys(ENTITY_TYPE_ID);
+    const results = await Promise.all(entities.map(e => loadCustomFieldsRaw(e).then(cfs => [e, cfs])));
+    return Object.fromEntries(results);
+  }
+
+  function loadCustomFieldMap(entityKey) {
+    if (!entityKey) return Promise.resolve({});
+    if (HU.customFieldMap[entityKey]) return Promise.resolve(HU.customFieldMap[entityKey]);
+    if (HU.customFieldMapPromises[entityKey]) return HU.customFieldMapPromises[entityKey];
+
+    const typeid = ENTITY_TYPE_ID[entityKey];
+    if (typeid == null) return Promise.resolve({});
+
+    const storageKey = `huCustomFields_${entityKey}`;
+
+    HU.customFieldMapPromises[entityKey] = (async () => {
+      try {
+        const stored = await new Promise(r => chrome.storage.local.get(storageKey, r));
+        const cached = stored && stored[storageKey];
+        if (cached && cached.entries && typeof cached.entries === 'object') {
+          HU.customFieldMap[entityKey] = cached.entries;
+          return cached.entries;
+        }
+      } catch (_) {}
+
+      try {
+        const resp = await haloApiRequest(
+          `/api/FieldInfo?iscustomfieldsetup=true&access_control_level=2&isconfig=true&typeid=${typeid}`
+        );
+        const arr = Array.isArray(resp) ? resp : (resp?.fields || resp?.fieldinfos || resp?.items || []);
+        const entries = {};
+        for (const f of arr) {
+          if (!f || typeof f !== 'object') continue;
+          const name = typeof f.name === 'string' ? f.name.trim() : '';
+          const label = typeof f.label === 'string' ? f.label.trim() : '';
+          if (!name || !label) continue;
+          entries[label.toLowerCase()] = name;
+        }
+        HU.customFieldMap[entityKey] = entries;
+        try {
+          chrome.storage.local.set({
+            [storageKey]: { entries, fetchedAt: Date.now() }
+          });
+        } catch (_) {}
+        return entries;
+      } catch (_) {
+        HU.customFieldMap[entityKey] = {};
+        return {};
+      }
+    })();
+
+    return HU.customFieldMapPromises[entityKey];
+  }
+
+  // ----- Slot-name resolver, fallback path -----
+  // Used when /api/Languages can't be loaded (permission denied, etc.) or
+  // is still in flight on first activation. Discovers the slot by
+  // value-matching the form input contents against the live API record.
+
+  async function getSlotRecordSafely() {
+    try {
+      const ctx = detectSlotRecordContext();
+      if (!ctx) return null;
+      if (!HU.slotRecordCache) HU.slotRecordCache = {};
+      const key = ctx.apiPath;
+      if (HU.slotRecordCache[key]) return HU.slotRecordCache[key];
+      const promise = haloApiRequest(ctx.apiPath).catch(() => null);
+      HU.slotRecordCache[key] = promise;
+      return promise;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function detectSlotRecordContext() {
+    const ctx = detectCurrentRecordQuery();
+    if (!ctx) return null;
+    if (!['User', 'Customer', 'Asset', 'Supplier', 'Site'].includes(ctx.type)) return null;
+    return ctx;
+  }
+
+  // Custom-field resolution covers everything in detectSlotRecordContext PLUS
+  // tickets — ticket forms have custom fields with the same DOM-slug issue,
+  // even though they don't carry `other1..N` slots.
+  function detectCustomFieldContext() {
+    const ctx = detectCurrentRecordQuery();
+    if (!ctx) return null;
+    if (!['User', 'Customer', 'Asset', 'Supplier', 'Site', 'Ticket'].includes(ctx.type)) return null;
+    return ctx;
+  }
+
+  function buildSlotValueMap(record) {
+    // value → slot name. Skip empty / null so blank form fields don't
+    // collide. If the same value appears in two slots, mark it ambiguous
+    // (null) so we don't pick the wrong one.
+    const map = new Map();
+    const slotFamilies = ['other', 'inv', 'userdef'];
+    for (const family of slotFamilies) {
+      for (let i = 1; i <= 25; i++) {
+        const slot = `${family}${i}`;
+        if (!(slot in record)) continue;
+        const v = record[slot];
+        if (v == null) continue;
+        const str = String(v).trim();
+        if (!str) continue;
+        if (map.has(str)) map.set(str, null);
+        else map.set(str, slot);
+      }
+    }
+    return map;
+  }
+
+  // ----- Value-matching fallback (ticket forms) -----
+  // Defensive fallback for labels that have no `for` attribute and no CF/slot
+  // match — read the form input's current value and look it up in a map built
+  // from the live ticket record. Restricted to own-entity scalars now that
+  // the DOM is the primary signal; cross-entity dot-paths are no longer
+  // produced (the DOM always points at the ticket's own field).
+
+  function loadTicketRecord(ticketId) {
+    const key = String(ticketId);
+    if (HU.ticketRecordPromises[key]) return HU.ticketRecordPromises[key];
+
+    // Include extras that Ticket 360 surfaces (linked objects, last/next
+    // appointment, "seen by"). Cheap additions to the same call so we
+    // don't pay a second round trip when 360 opens. `includeauditing` is
+    // deliberately left off — its payload is heavy and we don't render
+    // it yet.
+    HU.ticketRecordPromises[key] = (async () => {
+      try {
+        const ticket = await haloApiRequest(
+          `/api/tickets/${ticketId}?includedetails=true&includelinkedobjects=true` +
+          `&includelastappointment=true&includenextappointment=true&includeseenby=true`
+        );
+        if (!ticket || typeof ticket !== 'object') return null;
+        return ticket;
+      } catch (_) {
+        return null;
+      }
+    })();
+
+    return HU.ticketRecordPromises[key];
+  }
+
+  function buildTicketValueMap(record) {
+    if (!record) return null;
+    const map = new Map();
+    buildRecordValuePathMap(record, map);
+    return map;
+  }
+
+  // Runtime validation for resolved field names. Walks the dot-path against
+  // the cached record. Returns true if the leaf key exists (even if
+  // null/empty), false if any segment is missing, null if we have no record
+  // to check against. Caller treats null as "don't validate" so the legacy
+  // behaviour persists when the record isn't loaded yet (first activation,
+  // 403 on fetch, etc.).
+  function pathExistsInRecord(record, path) {
+    if (!record) return null;
+    if (!path || typeof path !== 'string') return null;
+    const parts = path.split('.');
+    let node = record;
+    for (let i = 0; i < parts.length - 1; i++) {
+      const p = parts[i];
+      if (node == null || typeof node !== 'object') return false;
+      node = node[p];
+    }
+    if (node == null || typeof node !== 'object') return false;
+    return parts[parts.length - 1] in node;
+  }
+
+  // Walk top-level scalars of a record into `{ lowercaseValue: fieldName }`.
+  // Skips nested objects entirely — the DOM-parsed `for` attribute always
+  // gives us the ticket's own field, never a cross-entity dot-path, so the
+  // value-matcher only needs to bridge "label without `for`" cases on the
+  // current entity. Colliding values are marked `null` so we never tag
+  // ambiguously.
+  function buildRecordValuePathMap(node, map) {
+    if (!node || typeof node !== 'object' || Array.isArray(node)) return;
+    for (const [key, value] of Object.entries(node)) {
+      if (value == null || typeof value === 'object') continue;
+      const str = normaliseValueForMatch(value);
+      if (!str) continue;
+      if (map.has(str)) {
+        if (map.get(str) !== key) map.set(str, null);
+      } else {
+        map.set(str, key);
+      }
+    }
+  }
+
+  function normaliseValueForMatch(value) {
+    if (value === true || value === false) return '';
+    const str = String(value).trim();
+    if (!str) return '';
+    // Halo "no value" date sentinel + pure numeric ids — both collide heavily.
+    if (/^(1900-01-01|0001-01-01)/.test(str)) return '';
+    if (/^-?\d+$/.test(str)) return '';
+    if (str.length > 200) return '';
+    return str.toLowerCase();
+  }
+
+  function resolveDotPathForLabel(label, pathMap) {
+    if (!pathMap || pathMap.size === 0) return null;
+    const values = collectLabelDisplayValues(label);
+    for (const v of values) {
+      const path = pathMap.get(v);
+      if (path) return path;
+    }
+    return null;
+  }
+
+  // Shared input/value scanner — mirrors the per-label collection logic in
+  // resolveSlotForLabel(). Kept separate so changes to slot resolution can't
+  // silently break value-matching for tickets.
+  function collectLabelDisplayValues(label) {
+    const values = new Set();
+    const addValue = (raw) => {
+      if (raw == null) return;
+      const v = normaliseValueForMatch(raw);
+      if (v) values.add(v);
+    };
+
+    const forId = label.getAttribute('for');
+    if (forId) {
+      const el = document.getElementById(forId);
+      if (el) addValue(el.value != null ? el.value : el.textContent);
+    }
+
+    const container = label.closest('div, li, tr, section, [class*="field"], [class*="form-group"], [class*="form-row"]') || label.parentElement;
+    if (container) {
+      container.querySelectorAll('input, textarea, select, [contenteditable="true"]').forEach(el => {
+        addValue(el.value != null ? el.value : el.textContent);
+      });
+      container.querySelectorAll('div, span, p, a, td').forEach(el => {
+        if (el === label || label.contains(el) || el.contains(label)) return;
+        if (el.classList.contains('hu-field-tag')) return;
+        if (el.querySelector('.hu-field-tag')) return;
+        if (el.children.length > 0) return;
+        addValue(el.textContent);
+      });
+    }
+    return values;
+  }
+
+  function resolveSlotForLabel(label, slotMap) {
+    // Collect every candidate value near the label — inputs (editable forms),
+    // textareas / selects / contenteditables, AND leaf text nodes inside the
+    // field's container (read-only display views render the value as plain
+    // text in a sibling <div>/<span>). Then look each candidate up in the
+    // slot map.
+    const values = new Set();
+    const addValue = (raw) => {
+      if (raw == null) return;
+      const v = String(raw).trim();
+      if (v && v.length <= 200) values.add(v);
+    };
+
+    const forId = label.getAttribute('for');
+    if (forId) {
+      const el = document.getElementById(forId);
+      if (el) addValue(el.value != null ? el.value : el.textContent);
+    }
+
+    const container = label.closest('div, li, tr, section, [class*="field"], [class*="form-group"], [class*="form-row"]') || label.parentElement;
+    if (container) {
+      container.querySelectorAll('input, textarea, select, [contenteditable="true"]').forEach(el => {
+        addValue(el.value != null ? el.value : el.textContent);
+      });
+      // Leaf text elements — exclude the label itself and our own overlay tags.
+      container.querySelectorAll('div, span, p, a, td').forEach(el => {
+        if (el === label || label.contains(el) || el.contains(label)) return;
+        if (el.classList.contains('hu-field-tag')) return;
+        if (el.querySelector('.hu-field-tag')) return;
+        if (el.children.length > 0) return;
+        addValue(el.textContent);
+      });
+    }
+
+    for (const v of values) {
+      const slot = slotMap.get(v);
+      if (slot) return slot;
+    }
+    return null;
   }
 
   function isTableCheckboxLabel(label) {
@@ -8566,10 +11106,25 @@ ${orderBy}
       normalized.includes('row_select');
   }
 
-  function getFieldApiName(label) {
+  function getFieldApiName(label, record) {
     const forId = label.getAttribute('for');
-    const candidates = [];
 
+    // Primary signal: Halo encodes the canonical field name directly in the
+    // label's `for` attribute as `input-field-for-{name}{optional-suffix}`.
+    // This works on read-only forms too, where Halo renders <div> instead of
+    // <input> so the usual element lookup returns nothing.
+    //
+    // Suffix patterns Halo appends for unique DOM ids:
+    //   `tickettype_id:12be36cec1-...`            colon-prefixed lookup hint
+    //   `category_1:T=1A=12S=1st Line Support...` same, with multiple params
+    //   `services_D=undefined43712bc0-...`        equals-prefixed param + GUID
+    //   `workflow_id3ca0a783-...`                 trailing GUID (8-4-4-4-12 hex)
+    //   `status_id1df421d64-...`                  trailing GUID + 1 extra hex prefix
+    //   `additional_agents0cbda18b-...`           trailing GUID without prefix
+    const parsed = parseInputFieldForId(forId, record);
+    if (parsed) return parsed;
+
+    const candidates = [];
     if (forId) candidates.push(document.getElementById(forId));
     const parent = label.closest('div, li, tr, section') || label.parentElement;
     if (parent) candidates.push(...parent.querySelectorAll('input, textarea, select, [name], [data-field], [data-fieldname], [data-column], [data-name]'));
@@ -8587,6 +11142,40 @@ ${orderBy}
     }
 
     return label.textContent ? label.textContent.trim().replace(/[^a-z0-9]+/gi, '_').replace(/^_+|_+$/g, '').toLowerCase() : '';
+  }
+
+  function parseInputFieldForId(forId, record) {
+    if (!forId || typeof forId !== 'string') return '';
+    if (!forId.startsWith('input-field-for-')) return '';
+    let raw = forId.slice('input-field-for-'.length);
+    // Strip Halo's `_PARAM=value...` lookup-metadata suffix first (e.g.
+    // `services_D=undefined<guid>`, where `_D` is the param marker — without
+    // this, the bare `[:=]` strip below would leave the `_D` orphaned on
+    // the field name). Real Halo canonical names are lowercase, so
+    // `_[A-Z]+=` only matches the metadata pattern.
+    raw = raw.replace(/_[A-Z]+=.*$/, '');
+    // Strip colon-prefixed lookup metadata (e.g. ":T=1A=12...") or any
+    // leftover equals-prefixed value.
+    raw = raw.replace(/[:=].*$/, '');
+    // Two candidate GUID-suffix strips:
+    //   longer  — assume no extra char before the GUID
+    //              (e.g. `workflow_id` from `workflow_id<guid>`)
+    //   shorter — assume Halo glued one hex char before the GUID
+    //              (e.g. `status_id`  from `status_id1<guid>` where Halo
+    //              prefixed the GUID with the field's current value `1`)
+    // The DOM alone can't disambiguate: both shapes are valid GUIDs because
+    // the first segment is just 8 hex chars in either reading. Pick the
+    // candidate that actually exists on the live record; default to the
+    // longer (less destructive) when the record isn't loaded.
+    const GUID = '[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$';
+    const longer  = raw.replace(new RegExp('[0-9a-f]{8}-' + GUID, 'i'), '');
+    const shorter = raw.replace(new RegExp('[0-9a-f][0-9a-f]{8}-' + GUID, 'i'), '');
+    if (longer === shorter) return cleanFieldName(longer);
+    if (record && typeof record === 'object') {
+      if (longer in record)  return cleanFieldName(longer);
+      if (shorter in record) return cleanFieldName(shorter);
+    }
+    return cleanFieldName(longer);
   }
 
   function cleanFieldName(value) {
@@ -8613,7 +11202,7 @@ ${orderBy}
     try {
       const record = detectCurrentRecordQuery();
       if (!record) {
-        body.innerHTML = '<div class="hu-row"><span class="hu-row-title">No supported record detected</span><span class="hu-row-sub">Open a ticket, customer, user, agent, or asset record and run this command again.</span></div>';
+        body.innerHTML = '<div class="hu-row"><span class="hu-row-title">No supported record detected</span><span class="hu-row-sub">Open a ticket, customer, site, user, agent, asset, KB article, quotation, sales order, purchase order, invoice, contract, project, or supplier record and run this command again.</span></div>';
         return;
       }
 
@@ -8666,17 +11255,66 @@ ${orderBy}
     const url = new URL(window.location.href);
     const path = url.pathname.toLowerCase();
     const params = url.searchParams;
-    const id = params.get('id') || params.get('faultid') || params.get('selid')
-            || params.get('agentid') || params.get('userid') || params.get('clientid');
+
+    // 1. Specific id-name params are unambiguous — `userid=21` means a User
+    //    record regardless of whether the path is `/customers` (Halo nests
+    //    users under Customers in its UI). Check these BEFORE the path.
+    const byParam = [
+      ['userid',     'User',           id => `/api/users/${id}`],
+      ['agentid',    'Agent',          id => `/api/agent/${id}`],
+      ['clientid',   'Customer',       id => `/api/client/${id}`],
+      ['siteid',     'Site',           id => `/api/site/${id}`],
+      ['kbid',       'KB article',     id => `/api/KBArticle/${id}`],
+      ['articleid',  'KB article',     id => `/api/KBArticle/${id}`],
+      ['quoteid',    'Quotation',      id => `/api/quotation/${id}`],
+      ['orderid',    'Sales order',    id => `/api/salesorder/${id}`],
+      ['poid',       'Purchase order', id => `/api/purchaseorder/${id}`],
+      ['invoiceid',  'Invoice',        id => `/api/invoice/${id}`],
+      ['projectid',  'Project',        id => `/api/project/${id}`],
+      ['contractid', 'Contract',       id => `/api/contract/${id}`],
+      ['supplierid', 'Supplier',       id => `/api/supplier/${id}`],
+      ['faultid',    'Ticket',         id => `/api/tickets/${id}`]
+    ];
+    for (const [param, type, build] of byParam) {
+      const raw = params.get(param);
+      if (!raw) continue;
+      const n = Number(raw);
+      if (!Number.isFinite(n)) continue;
+      return { type, id: String(n), apiPath: build(n) };
+    }
+
+    // 2. Fall back to the generic `id=` / `selid=` param + path context.
+    const id = params.get('id') || params.get('selid');
     if (!id) return null;
     const safeId = Number(id);
     if (!Number.isFinite(safeId)) return null;
 
-    // Map URL paths to the entity-API endpoint that returns the raw record.
-    // Each endpoint respects the agent's ticket/user/agent/asset view permission,
-    // so non-admin agents see the records they're allowed to see.
     if ((path.includes('/ticket') || path.includes('/fault')) && !path.includes('/config/')) {
       return { type: 'Ticket', id, apiPath: `/api/tickets/${safeId}` };
+    }
+    if (path.includes('/knowledgebase') || path.includes('/kb')) {
+      return { type: 'KB article', id, apiPath: `/api/KBArticle/${safeId}` };
+    }
+    if (path.includes('/quotation') || path.includes('/quote')) {
+      return { type: 'Quotation', id, apiPath: `/api/quotation/${safeId}` };
+    }
+    if (path.includes('/salesorder') || path.includes('/sales-order') || path.includes('/orders')) {
+      return { type: 'Sales order', id, apiPath: `/api/salesorder/${safeId}` };
+    }
+    if (path.includes('/purchaseorder') || path.includes('/purchase-order')) {
+      return { type: 'Purchase order', id, apiPath: `/api/purchaseorder/${safeId}` };
+    }
+    if (path.includes('/invoice')) {
+      return { type: 'Invoice', id, apiPath: `/api/invoice/${safeId}` };
+    }
+    if (path.includes('/contract')) {
+      return { type: 'Contract', id, apiPath: `/api/contract/${safeId}` };
+    }
+    if (path.includes('/project')) {
+      return { type: 'Project', id, apiPath: `/api/project/${safeId}` };
+    }
+    if (path.includes('/supplier')) {
+      return { type: 'Supplier', id, apiPath: `/api/supplier/${safeId}` };
     }
     if (path.includes('/customer') || path.includes('/area') || path.includes('/client')) {
       return { type: 'Customer', id, apiPath: `/api/client/${safeId}` };
@@ -9311,27 +11949,70 @@ ${orderBy}
     }
   }
 
+  // Returns true if the mutation reflects a real DOM change Halo made, not
+  // our own tag insertion/removal or click-to-copy text swap. Without this,
+  // revealFieldNames (which adds/removes .hu-field-tag spans) would trigger
+  // the MutationObserver in initNavigationTracking, which would re-run
+  // revealFieldNames, which would trigger another mutation, forever.
+  function mutationIsRelevant(m) {
+    // If the mutation happened inside one of our tags (text swap, class
+    // toggle), ignore it.
+    let n = m.target;
+    while (n && n.nodeType === 1) {
+      if (n.classList && n.classList.contains('hu-field-tag')) return false;
+      n = n.parentNode;
+    }
+    if (m.type !== 'childList') return true;
+    // childList mutation — relevant only if at least one added or removed
+    // node ISN'T one of our tags.
+    const isTagEl = (node) => node.nodeType === 1 && node.classList && node.classList.contains('hu-field-tag');
+    for (const node of m.addedNodes)   if (!isTagEl(node)) return true;
+    for (const node of m.removedNodes) if (!isTagEl(node)) return true;
+    return false;
+  }
+
   function initNavigationTracking() {
     setTimeout(() => {
       sendContext();
       trackRecentRecord();
       maybeScrapeConfigPage();
+      // Warm the slot-label cache (chrome.storage hit ~ms, first-ever fetch
+      // 8 MB) so by the time the user activates the field overlay the map
+      // is in HU.slotLabelMap. No await — revealFieldNames falls back to
+      // value-matching if the map isn't ready yet.
+      loadSlotLabelMap();
+      // Warm the ticket value-map too if we're on a ticket page — same
+      // motivation: by the time `/f` runs, the fetch is already cached.
+      const ctxAtBoot = detectCustomFieldContext();
+      if (ctxAtBoot && ctxAtBoot.type === 'Ticket') loadTicketRecord(ctxAtBoot.id);
       // Fire-and-forget probe of /api/Report so Data Viewer + Schema gating
       // has a definitive answer. Resend context once the probe resolves.
       probeReportApi().then(() => sendContext()).catch(() => {});
     }, 1200);
 
     let lastUrl = location.href;
-    const observer = new MutationObserver(() => {
+    const observer = new MutationObserver((mutations) => {
+      // Filter out mutations caused by our own tag insertion/removal AND by
+      // the click-to-copy "Copied" text swap. Without this, revealFieldNames
+      // re-renders every 400ms forever (each render is itself a mutation).
+      const meaningful = mutations.some(mutationIsRelevant);
+      if (!meaningful) return;
+
       if (location.href !== lastUrl) {
         lastUrl = location.href;
         setTimeout(() => {
           sendContext();
           trackRecentRecord();
           maybeScrapeConfigPage();
+          const ctxOnNav = detectCustomFieldContext();
+          if (ctxOnNav && ctxOnNav.type === 'Ticket') loadTicketRecord(ctxOnNav.id);
           if (HU.fieldOverlayOn) revealFieldNames();
           injectTicket360Button();
           const newId = getCurrentTicketId();
+          // Audit log is always tied to one ticket; close it on any ticket
+          // navigation so the user doesn't see stale data for a different
+          // record.
+          closeDrawer('hu-audit-drawer');
           if (!newId) {
             closeDrawer('hu-ticket360-drawer');
             closeDrawer('hu-timeline-drawer');
@@ -9429,7 +12110,8 @@ ${orderBy}
               totalClaims: permissions.totalClaims || 0,
               currentAgentId: permissions.currentAgentId || '',
               parentAgentId: permissions.parentAgentId || '',
-              isImpersonating: !!permissions.isImpersonating
+              isImpersonating: !!permissions.isImpersonating,
+              staleImpersonationMarker: !!permissions.staleImpersonationMarker
             },
             reportApiOk: reportOk,
             reportApiError: HU.reportApiError || '',
@@ -9439,6 +12121,52 @@ ${orderBy}
           }
         });
       }).catch(error => sendResponse({ ok: false, error: error.message }));
+      return true;
+    }
+
+    if (message.type === 'HU_GET_ENTITY_SAMPLES') {
+      // Side-panel schema explorer asks for one sample record per entity so
+      // it can harvest the API field names (canonical lowercase form) and
+      // surface them alongside the SQL column names from tables.json.
+      loadEntitySamples()
+        .then(data => sendResponse({ ok: true, data }))
+        .catch(error => sendResponse({ ok: false, error: error.message }));
+      return true;
+    }
+
+    if (message.type === 'HU_GET_FIELDINFO') {
+      // Side-panel schema explorer asks for all custom fields per entity.
+      // Returns { ticket: [...], user: [...], ... } — typically ~50-500 CFs
+      // total, depending on tenant. Admin-gated by Halo; non-admins may
+      // get empty arrays. The panel renders whatever comes back.
+      loadAllCustomFields()
+        .then(data => sendResponse({ ok: true, data }))
+        .catch(error => sendResponse({ ok: false, error: error.message }));
+      return true;
+    }
+
+    if (message.type === 'HU_GET_VIEW_COLUMNS') {
+      // Side-panel schema explorer asks for saved-view column metadata so
+      // it can label otherwise-cryptic API field names with their list-
+      // grid titles (e.g. `last_update_text` → "Last Updated").
+      loadViewColumnLabels()
+        .then(data => sendResponse({ ok: true, data }))
+        .catch(error => sendResponse({ ok: false, error: error.message }));
+      return true;
+    }
+
+    if (message.type === 'HU_PANEL_LOG') {
+      // Side panel has its own console nobody can open — surface logs in the Halo page DevTools.
+      try { console.log(message.data?.text || ''); } catch (_) {}
+      sendResponse({ ok: true });
+      return false;
+    }
+
+    if (message.type === 'HU_GET_COLUMN_PROFILES') {
+      const entity = message.data?.entity;
+      loadColumnProfilesForEntity(entity)
+        .then(profiles => sendResponse({ ok: true, profiles }))
+        .catch(error => sendResponse({ ok: false, error: error.message }));
       return true;
     }
 
@@ -9452,6 +12180,13 @@ ${orderBy}
           reportApiError: HU.reportApiError || ''
         });
       }).catch(error => sendResponse({ ok: false, error: error.message }));
+      return true;
+    }
+
+    if (message.type === 'HU_RUN_EXTENDED_PROBES') {
+      runExtendedProbes()
+        .then(data => sendResponse({ ok: true, data }))
+        .catch(error => sendResponse({ ok: false, error: error.message }));
       return true;
     }
 
@@ -9976,6 +12711,15 @@ WHERE COLUMN_NAME LIKE 'CF%'
   // - probeEntityAccess(): per-entity API access for greying-out palette commands.
   setTimeout(() => { probeReportApi().catch(() => {}); }, 500);
   setTimeout(() => { probeEntityAccess().catch(() => {}); }, 2000);
+  // Environment banner — read storage for any per-host override and paint
+  // a thin coloured strip + chip at the top of the page. Re-paint when the
+  // user changes the override in the side panel.
+  refreshEnvironmentBanner();
+  try {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === 'local' && changes.huCustomDomainsMeta) refreshEnvironmentBanner();
+    });
+  } catch (_) {}
   setTimeout(() => {
     injectTicket360Button();
     scheduleAutoTicket360();

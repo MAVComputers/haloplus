@@ -22,6 +22,20 @@ const LAST_SEEN_VERSION_KEY = 'huLastSeenVersion';
 // belong in CHANGELOG.md. Only the entries for the current manifest version
 // are surfaced.
 const RELEASE_HIGHLIGHTS = {
+  '1.3.0': {
+    title: 'What\'s new in HaloPlus 1.3.0',
+    items: [
+      ['Tenant environment label', 'A colour-coded chip on every Halo page tells you which tenant and which environment you\'re on — red for live, amber for sandbox, blue for dev. Drag the chip anywhere along the screen edge and it snaps to the corner you let go of. Stops you from changing PROD when you meant to test in sandbox.'],
+      ['Custom Halo domains, rebuilt', 'The custom-domains card now lets you label each tenant ("ACME LIVE", "Pink Sandbox") and pick its environment, so the chip is meaningful for tenants on custom URLs. The add dialog stays hidden until you click "+ Add tenant" and pre-fills the hostname from the page you\'re on.'],
+      ['Audit log in Ticket 360', 'New "View audit log" link in the 360 footer opens a side drawer with the ticket\'s full change history, grouped by transaction. Field names are translated to friendly labels, and ID-backed values (status, priority, agent, team, workflow, impact, urgency, ticket type) are resolved to real names. Filter by field with a live counter and most-changed chips at the top.'],
+      ['Popup notes, viewed-by and appointments in 360', 'Halo popup notes (VIP / contract warnings) now show as banners above the ticket summary, honouring their dismissable / modal / HTML / date-range settings. A "viewed by" chip shows other agents who recently opened the ticket. A next/last appointment chip appears in the badge strip when one is set.'],
+      ['Data Viewer: saved queries + column profiles', 'Save the current SQL + filters under a name, recall from the new star menu on any table. Column picker now offers HaloPlus presets plus your tenant\'s own saved views (Tickets, Customers, Sites, Users, Assets) — pick one and the table renders the same columns you\'d see in Halo\'s list view. Toggle between SQL / API / Both perspectives on the schema explorer.'],
+      ['244-endpoint API reference', '/api was rebuilt from Halo\'s swagger. The drawer ships 244 endpoints across 13 categories with a sticky search box, multi-select method chips (GET / POST / PUT / DELETE / PATCH), and a live "X of Y" count. Each row expands to show path and query parameters. Search matches param names too — type "client_id" to find every endpoint that takes one.'],
+      ['Schema labels from saved views + clickable FKs', 'The schema explorer reads /api/ViewColumns and stitches your tenant\'s friendly column titles onto matching API rows. Columns that only appear in saved views are added as new rows. FK chips (e.g. FK -> site.SSitenum) are now interactive — click to jump to the referenced table and flash the destination column.'],
+      ['Extended endpoint probes', 'Diagnostics has a new "Run extended probes" button that tests 10 candidate endpoints — /api/Agent/me, /api/Search, /api/ViewColumns, /api/PopupNote, /api/FaultViewLog and more — reporting HTTP status, latency, and response shape. Use it to see what your role unlocks.'],
+      ['Preferences UX rework', 'Cards reordered and renamed (Ticket 360 → In-page tools → Advanced), labels rewritten, sub-prefs stay visible (greyed out) when their parent is off so you can see what re-enabling unlocks. Toggles a touch larger with cleaner hover and focus states.']
+    ]
+  },
   '1.2.1': {
     title: 'What\'s new in HaloPlus 1.2.1',
     items: [
@@ -67,8 +81,87 @@ let viewerState = {
   lastRows: [],
   lastSql: '',
   pageSize: 20,
-  currentPage: 1
+  currentPage: 1,
+  // Column view selection. Values:
+  //   'default'      → top-N scored heuristic (legacy behaviour)
+  //   'all'          → every SQL-queryable column on the table
+  //   'profile:<id>' → Halo's saved column profile from /api/ViewColumns
+  columnView: 'default',
+  // Cached Halo column profiles for the current table (loaded lazily).
+  // null = not yet attempted, [] = loaded but empty, else array of profiles.
+  cachedProfiles: null
 };
+
+// Tables we can fetch Halo column profiles for. Halo's /api/ViewColumns
+// covers ticket / customer / site / user / asset / supplier — agents and
+// other entities have no profile endpoint, so we just don't offer the
+// dropdown for those tables.
+const TABLE_TO_VIEWCOLUMN_ENTITY = {
+  faults:  'ticket',
+  users:   'user',
+  area:    'customer',
+  site:    'site',
+  device:  'asset',
+  company: 'supplier'
+};
+
+async function loadColumnProfilesForCurrentTable() {
+  const tableId = viewerState.tableId;
+  const entity = TABLE_TO_VIEWCOLUMN_ENTITY[tableId];
+  if (!entity) return [];
+  return new Promise(resolve => {
+    chrome.runtime.sendMessage({ type: 'HU_GET_COLUMN_PROFILES', data: { entity } }, response => {
+      if (chrome.runtime.lastError || !response?.ok) { resolve([]); return; }
+      resolve(Array.isArray(response.profiles) ? response.profiles : []);
+    });
+  });
+}
+
+// Resolve one ViewColumns `column_name` (API field name) to the actual
+// SQL column we can SELECT in our query. Returns null when the column
+// can't be mapped to SQL.
+//
+// Resolution order (most specific → fuzziest):
+//   1. Direct case-sensitive match on the SQL column name.
+//   2. Curated API_TO_SQL_NAME mapping for this table.
+//   3. Case-insensitive direct match.
+//   4. `col.apiAlias` annotation populated by mergeApiFieldKeys when the
+//      schema's API-record harvest matched this API name to an SQL column.
+function resolveProfileColumnToSql(tableId, apiName) {
+  const table = TABLES[tableId];
+  if (!table || !apiName) return null;
+  const lookup = String(apiName).trim();
+  if (!lookup) return null;
+  const lowered = lookup.toLowerCase();
+
+  // 1. Direct case-sensitive match
+  const direct = table.columns[lookup];
+  if (direct && direct.type !== 'api') return { name: lookup, col: direct };
+
+  // 2. Curated mapping (e.g. summary → Symptom on faults)
+  const mapping = (typeof API_TO_SQL_NAME === 'object' && API_TO_SQL_NAME[tableId]) || {};
+  const sqlName = mapping[lookup];
+  if (sqlName && table.columns[sqlName] && table.columns[sqlName].type !== 'api') {
+    return { name: sqlName, col: table.columns[sqlName] };
+  }
+
+  // 3. Case-insensitive direct match — Halo often returns lowercase names
+  //    while our SQL schema uses PascalCase (UUsername, UEmail, etc.).
+  for (const [name, col] of Object.entries(table.columns)) {
+    if (col.type === 'api') continue;
+    if (name.toLowerCase() === lowered) return { name, col };
+  }
+
+  // 4. apiAlias match — set when the schema harvest matched this API
+  //    name to an SQL column. Works for tables we never put in the
+  //    curated map.
+  for (const [name, col] of Object.entries(table.columns)) {
+    if (col.type === 'api') continue;
+    const alias = col.apiAlias;
+    if (alias && String(alias).toLowerCase() === lowered) return { name, col };
+  }
+  return null;
+}
 
 let customHaloMatches = [];
 
@@ -109,6 +202,9 @@ async function init() {
   syncManifestVersion();
   TABLES = await loadJSON('../schema/tables.json');
   await loadCustomSchema();
+  await loadCachedFieldInfoCFs();
+  await loadCachedApiFieldKeys();
+  await loadCachedViewColumnLabels();
   await loadCustomHaloDomains();
   const joinsData = await loadJSON('../schema/joins.json');
   JOINS = joinsData.joins;
@@ -209,6 +305,33 @@ function autoRefreshSchema() {
     populateTablePicker();
     renderSchemaExplorer();
   }).catch(() => {});
+
+  // Independent of the SQL-based schema refresh — FieldInfo may work where
+  // /api/Report doesn't, and vice versa. Both populate the explorer.
+  refreshFieldInfoCFs().then(payload => {
+    if (!payload) return;
+    populateTablePicker();
+    renderSchemaExplorer();
+  }).catch(() => {});
+
+  // Harvest API field names from sample records — works for non-admins,
+  // doesn't depend on /api/Report. This is what makes `workflow_id`,
+  // `dateoccurred`, etc. (API canonical names) findable in the schema
+  // explorer alongside their SQL counterparts.
+  refreshApiFieldKeys().then(payload => {
+    if (!payload) return;
+    populateTablePicker();
+    renderSchemaExplorer();
+  }).catch(() => {});
+
+  // Harvest list-grid column labels from saved views. Provides the
+  // friendly "Last Updated"-style overrides that the sample-record path
+  // can't surface (the sample only carries field names, no labels).
+  refreshViewColumnLabels().then(payload => {
+    if (!payload) return;
+    populateTablePicker();
+    renderSchemaExplorer();
+  }).catch(() => {});
 }
 
 async function loadJSON(path) {
@@ -283,17 +406,83 @@ function setupTabs() {
   });
 }
 
+// Schema perspective. Three modes:
+//   'both' — show everything as-is (default).
+//   'sql'  — for report writers; show SQL columns, hide API-only fields,
+//            API alias appears as a small `API: x` chip.
+//   'api'  — for API integrators; show API field names as primary, hide
+//            SQL-only columns, SQL column appears as a small `SQL: X` chip.
+let schemaPerspective = 'both';
+
+// Should the column be visible in the current perspective?
+function columnVisibleInPerspective(col) {
+  if (schemaPerspective === 'both') return true;
+  if (schemaPerspective === 'sql') {
+    // SQL view: hide API-only fields (no underlying SQL column to query).
+    return col.type !== 'api';
+  }
+  if (schemaPerspective === 'api') {
+    // API view: hide SQL columns that have no API equivalent.
+    return col.api === true || col.type === 'api';
+  }
+  return true;
+}
+
+// Return what to display in each slot for the current perspective.
+// In API mode we swap primary/alias so the API name reads first.
+function getColumnDisplay(colName, col) {
+  if (schemaPerspective === 'api' && col.apiAlias) {
+    return {
+      primary: col.apiAlias,
+      alias: colName,                       // SQL column shown as the "see also" chip
+      aliasLabel: 'SQL column name'
+    };
+  }
+  return {
+    primary: colName,
+    alias: (col.apiAlias && col.apiAlias !== colName) ? col.apiAlias : '',
+    aliasLabel: 'API field name'
+  };
+}
+
+function columnMatchesFilter(colName, col, lowerFilter) {
+  if (!lowerFilter) return true;
+  if (colName.toLowerCase().includes(lowerFilter)) return true;
+  if (col.label && col.label.toLowerCase().includes(lowerFilter)) return true;
+  if (col.viewLabel && col.viewLabel.toLowerCase().includes(lowerFilter)) return true;
+  if (col.apiAlias && col.apiAlias.toLowerCase().includes(lowerFilter)) return true;
+  // CF-only fields exposed to search so "/$SYMPTOM" or "/$CFmobile" lands
+  // on the right row directly.
+  if (col.cfVariable && col.cfVariable.toLowerCase().includes(lowerFilter)) return true;
+  if (col.cfHint && col.cfHint.toLowerCase().includes(lowerFilter)) return true;
+  // Picklist option matching — "/in progress" finds status_id even though
+  // the column name doesn't contain those words.
+  if (Array.isArray(col.cfValues) && col.cfValues.some(v => (v.name || '').toLowerCase().includes(lowerFilter))) return true;
+  // Tickettype binding matching — "/incident" finds CFs only used on
+  // Incident-type tickets.
+  if (Array.isArray(col.cfTickettypes) && col.cfTickettypes.some(t => (t.name || '').toLowerCase().includes(lowerFilter))) return true;
+  return false;
+}
+
 function renderSchemaExplorer(filter = '') {
   const container = document.getElementById('schemaList');
   container.innerHTML = '';
   const lowerFilter = filter.toLowerCase();
 
   Object.entries(TABLES).forEach(([tableId, table]) => {
-    const cols = Object.entries(table.columns);
-    const tableMatches = !lowerFilter ||
-      tableId.includes(lowerFilter) ||
-      table.label.toLowerCase().includes(lowerFilter) ||
-      cols.some(([cn, cd]) => cn.toLowerCase().includes(lowerFilter) || cd.label.toLowerCase().includes(lowerFilter));
+    // Perspective filter — apply first so we don't show table headers with
+    // no visible columns when the user flips to SQL or API mode.
+    const visibleCols = Object.entries(table.columns).filter(([, c]) => columnVisibleInPerspective(c));
+    if (visibleCols.length === 0) return;
+
+    const cols = visibleCols;
+    const tableTextMatches = lowerFilter && (
+      tableId.includes(lowerFilter) || table.label.toLowerCase().includes(lowerFilter)
+    );
+    const hasMatchingCol = cols.some(([cn, cd]) => columnMatchesFilter(cn, cd, lowerFilter));
+    // Show table if nothing's filtering, the table itself text-matches, or
+    // at least one of its columns matches the combined text + type filter.
+    const tableMatches = !lowerFilter || tableTextMatches || hasMatchingCol;
 
     if (!tableMatches) return;
 
@@ -305,25 +494,104 @@ function renderSchemaExplorer(filter = '') {
         <span class="st-name">${escapeHtml(tableId)}</span>
         <span class="st-label">${escapeHtml(table.label)}</span>
       </div>
-      <span class="st-arrow">&#9654;</span>
+      <div class="st-actions">
+        <button class="st-query-btn" type="button" title="Open this table in the Data Viewer">Query &rarr;</button>
+        <span class="st-arrow">&#9654;</span>
+      </div>
     `;
     header.addEventListener('click', () => wrapper.classList.toggle('open'));
+    const queryBtn = header.querySelector('.st-query-btn');
+    if (queryBtn) {
+      queryBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        openTableInDataViewer(tableId);
+      });
+    }
 
     const colsDiv = el('div', { class: 'schema-cols' });
     cols.forEach(([colName, col]) => {
-      if (lowerFilter && !colName.toLowerCase().includes(lowerFilter) && !col.label.toLowerCase().includes(lowerFilter) && !tableId.includes(lowerFilter) && !table.label.toLowerCase().includes(lowerFilter)) return;
+      // Skip non-matching rows when there's an active text filter and the
+      // table itself didn't text-match. Tables matched by name show all
+      // their columns.
+      if (lowerFilter && !tableId.includes(lowerFilter) && !table.label.toLowerCase().includes(lowerFilter)
+          && !columnMatchesFilter(colName, col, lowerFilter)) return;
 
-      const row = el('div', { class: 'schema-col' });
+      const hasExpand = !!(col.cf && ((col.cfValues && col.cfValues.length) || (col.cfTickettypes && col.cfTickettypes.length)));
+
+      const row = el('div', { class: 'schema-col' + (hasExpand ? ' has-expand' : '') });
       let badges = '';
       if (col.pk) badges += '<span class="sc-pk">PK</span> ';
-      if (col.fk) badges += `<span class="sc-fk">FK -> ${escapeHtml(col.fk)}</span> `;
+      if (col.fk) {
+        const fkTarget = String(col.fk).split('.')[0];
+        const clickable = TABLES[fkTarget];
+        const fkAttrs = clickable
+          ? ` data-fk="${escapeHtml(col.fk)}" title="Jump to ${escapeHtml(col.fk)}"`
+          : '';
+        const fkClass = clickable ? 'sc-fk sc-fk-clickable' : 'sc-fk';
+        badges += `<span class="${fkClass}"${fkAttrs}>FK -> ${escapeHtml(col.fk)}</span> `;
+      }
+      if (col.cf) {
+        const tooltipBits = [];
+        if (col.cfHint) tooltipBits.push(col.cfHint);
+        if (col.cfVariable) tooltipBits.push(`Variable: ${col.cfVariable}`);
+        if (col.cfTab) tooltipBits.push(`Tab: ${col.cfTab}`);
+        if (col.cfGroup) tooltipBits.push(`Group: ${col.cfGroup}`);
+        const tip = tooltipBits.join('\n');
+        badges += `<span class="sc-cf"${tip ? ` title="${escapeHtml(tip)}"` : ''}>CF</span> `;
+      }
+      if (col.api) {
+        badges += '<span class="sc-api" title="API field name (from /api/&lt;entity&gt; response). May map to a different SQL column.">API</span> ';
+      }
+      const expandArrow = hasExpand ? '<span class="sc-expand" aria-label="Expand">&#9654;</span> ' : '';
+      // Primary name + alias chip depend on perspective. In API mode the
+      // API name reads first; the SQL column appears as a `SQL: X` chip on
+      // rows that have a curated mapping. Both/SQL modes show SQL column
+      // first with the API alias as the chip.
+      const disp = getColumnDisplay(colName, col);
+      const aliasMarkup = disp.alias
+        ? `<span class="sc-alias" title="${escapeHtml(disp.aliasLabel)}">${escapeHtml(disp.alias)}</span>`
+        : '';
+      // When ViewColumns gave us a list-grid label that differs from the
+      // static schema's label, surface it as a small chip so the user sees
+      // the tenant's tenant-customised header text.
+      const viewLabelMarkup = (col.viewLabel && col.viewLabel !== col.label)
+        ? `<span class="sc-view-label" title="List-grid label from a saved view (/api/ViewColumns)">${escapeHtml(col.viewLabel)}</span>`
+        : '';
       row.innerHTML = `
-        <span class="sc-name">${escapeHtml(colName)}</span>
+        ${expandArrow}
+        <span class="sc-name">${escapeHtml(disp.primary)}</span>
+        ${aliasMarkup}
         <span class="sc-label">${escapeHtml(col.label)}</span>
+        ${viewLabelMarkup}
         <span class="sc-type">${escapeHtml(col.type)}</span>
         ${badges}
       `;
       colsDiv.appendChild(row);
+
+      if (hasExpand) {
+        const detail = el('div', { class: 'schema-col-detail' });
+        detail.innerHTML = renderCfDetail(col);
+        colsDiv.appendChild(detail);
+
+        const toggle = () => {
+          const open = row.classList.toggle('open');
+          detail.classList.toggle('open', open);
+        };
+        row.addEventListener('click', toggle);
+
+        // Auto-expand when the filter matched something inside the detail
+        // (a picklist value or tickettype name).
+        if (lowerFilter && !colName.toLowerCase().includes(lowerFilter) && !col.label.toLowerCase().includes(lowerFilter)) {
+          const inDetail =
+            (col.cfValues || []).some(v => (v.name || '').toLowerCase().includes(lowerFilter)) ||
+            (col.cfTickettypes || []).some(t => (t.name || '').toLowerCase().includes(lowerFilter));
+          if (inDetail) {
+            row.classList.add('open');
+            detail.classList.add('open');
+          }
+        }
+      }
     });
 
     wrapper.appendChild(header);
@@ -335,10 +603,37 @@ function renderSchemaExplorer(filter = '') {
   });
 }
 
+function renderCfDetail(col) {
+  const parts = [];
+  const tickettypes = col.cfTickettypes || [];
+  const values = col.cfValues || [];
+
+  if (tickettypes.length) {
+    const pills = tickettypes
+      .map(t => `<span class="cf-pill cf-pill-tt">${escapeHtml(t.name)}</span>`)
+      .join('');
+    parts.push(`<div class="cf-section"><div class="cf-section-title">On ${tickettypes.length} ticket type${tickettypes.length === 1 ? '' : 's'}</div><div class="cf-pill-row">${pills}</div></div>`);
+  }
+
+  if (values.length) {
+    const rows = values
+      .map(v => {
+        const idText = (v.id != null && v.id !== '') ? `<span class="cf-value-id">${escapeHtml(String(v.id))}</span>` : '';
+        return `<div class="cf-value-row">${idText}<span class="cf-value-name">${escapeHtml(v.name)}</span></div>`;
+      })
+      .join('');
+    const capNote = values.length === 100 ? '<div class="cf-cap-note">(first 100 shown)</div>' : '';
+    parts.push(`<div class="cf-section"><div class="cf-section-title">${values.length} option${values.length === 1 ? '' : 's'}</div><div class="cf-value-list">${rows}</div>${capNote}</div>`);
+  }
+
+  return parts.join('');
+}
+
 let TABLE_PICKER_CUSTOM_TABLES = new Set();
 
 function renderDataViewer() {
   populateTablePicker();
+  renderSavedQueriesBar();
 
   if (!viewerState.tableId) {
     document.getElementById('recordHeader').innerHTML = `
@@ -356,6 +651,160 @@ function renderDataViewer() {
   }
 
   renderRecordViewer();
+}
+
+// ── Saved Data Viewer queries ───────────────────────────────────────────
+// Persists per-user under chrome.storage.local. Each entry stores the
+// table the user was on, the active filter rows, and the quick-filter
+// text — enough to restore the exact view next time.
+const SAVED_QUERIES_KEY = 'huSavedQueries';
+
+async function loadSavedQueries() {
+  return new Promise(resolve => {
+    chrome.storage.local.get([SAVED_QUERIES_KEY], data => {
+      if (chrome.runtime.lastError) { resolve([]); return; }
+      const list = Array.isArray(data && data[SAVED_QUERIES_KEY]) ? data[SAVED_QUERIES_KEY] : [];
+      resolve(list);
+    });
+  });
+}
+
+async function persistSavedQueries(list) {
+  await new Promise(r => chrome.storage.local.set({ [SAVED_QUERIES_KEY]: list }, r));
+}
+
+async function saveCurrentQuery() {
+  const tableId = viewerState.tableId;
+  if (!tableId) return;
+  const quickFilter = (document.getElementById('viewerQuickFilter') || {}).value || '';
+  // Default name suggests the table + filter count for a sensible starting point.
+  const filterCount = (viewerState.filters || []).length;
+  const defaultName = `${TABLES[tableId]?.label || tableId}${filterCount ? ' · ' + filterCount + ' filter' + (filterCount === 1 ? '' : 's') : ''}`;
+  const name = prompt('Save this query as:', defaultName);
+  if (!name || !name.trim()) return;
+
+  const list = await loadSavedQueries();
+  list.push({
+    id: 'sq_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    name: name.trim().slice(0, 60),
+    tableId,
+    filters: JSON.parse(JSON.stringify(viewerState.filters || [])),
+    quickFilter,
+    columnView: viewerState.columnView || 'default',
+    savedAt: new Date().toISOString()
+  });
+  // Sort by savedAt desc so newest appears first.
+  list.sort((a, b) => (b.savedAt || '').localeCompare(a.savedAt || ''));
+  await persistSavedQueries(list);
+  renderSavedQueriesBar();
+}
+
+async function loadQueryById(id) {
+  const list = await loadSavedQueries();
+  const entry = list.find(e => e.id === id);
+  if (!entry || !TABLES[entry.tableId]) return;
+  viewerState.tableId = entry.tableId;
+  viewerState.filters = Array.isArray(entry.filters) ? JSON.parse(JSON.stringify(entry.filters)) : [];
+  viewerState.lookupOptions = {};
+  viewerState.lastRows = [];
+  viewerState.currentPage = 1;
+  viewerState.columnView = entry.columnView || 'default';
+  viewerState.cachedProfiles = null;
+  // Sync the picker label + quick filter input.
+  const displayEl = document.getElementById('tablePickerValue');
+  if (displayEl) {
+    displayEl.textContent = entry.tableId;
+    displayEl.classList.remove('placeholder');
+  }
+  const qf = document.getElementById('viewerQuickFilter');
+  if (qf) qf.value = entry.quickFilter || '';
+  const clearBtn = document.getElementById('clearTableBtn');
+  if (clearBtn) clearBtn.style.display = entry.tableId ? '' : 'none';
+
+  renderDataViewer();
+  // Auto-run so the user sees results immediately.
+  if (typeof buildViewerSQL === 'function') buildViewerSQL({ run: true });
+}
+
+async function deleteQueryById(id) {
+  const list = await loadSavedQueries();
+  const next = list.filter(e => e.id !== id);
+  await persistSavedQueries(next);
+  renderSavedQueriesBar();
+}
+
+async function renderSavedQueriesBar() {
+  const wrap = document.getElementById('savedQueriesWrap');
+  const listHost = document.getElementById('savedQueriesList');
+  const saveBtn = document.getElementById('saveQueryBtn');
+  const countEl = document.getElementById('sqCount');
+  if (!wrap || !listHost) return;
+
+  const list = await loadSavedQueries();
+
+  // Show the control whenever we have either a table to save OR at least
+  // one saved query. Hide entirely when neither is true so the toolbar
+  // stays clean for first-time users.
+  if (!list.length && !viewerState.tableId) {
+    wrap.style.display = 'none';
+    return;
+  }
+  wrap.style.display = '';
+  if (saveBtn) saveBtn.disabled = !viewerState.tableId;
+  if (countEl) countEl.textContent = list.length ? `(${list.length})` : '';
+
+  listHost.innerHTML = '';
+  if (!list.length) {
+    const hint = document.createElement('div');
+    hint.className = 'sq-empty';
+    hint.textContent = 'No saved queries yet.';
+    listHost.appendChild(hint);
+    return;
+  }
+
+  list.forEach(entry => {
+    const tableLabel = TABLES[entry.tableId]?.label || entry.tableId;
+    const filterCount = Array.isArray(entry.filters) ? entry.filters.length : 0;
+    const sub = `${tableLabel}${filterCount ? ' · ' + filterCount + ' filter' + (filterCount === 1 ? '' : 's') : ''}`;
+    const item = document.createElement('div');
+    item.className = 'sq-item';
+    item.innerHTML = `
+      <button type="button" class="sq-item-load" title="Load this query">
+        <span class="sq-item-name">${escapeHtml(entry.name)}</span>
+        <span class="sq-item-sub">${escapeHtml(sub)}</span>
+      </button>
+      <button type="button" class="sq-item-del" title="Delete this query" aria-label="Delete">&times;</button>
+    `;
+    item.querySelector('.sq-item-load').addEventListener('click', () => {
+      closeSavedMenu();
+      loadQueryById(entry.id);
+    });
+    item.querySelector('.sq-item-del').addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (confirm(`Delete saved query "${entry.name}"?`)) deleteQueryById(entry.id);
+    });
+    listHost.appendChild(item);
+  });
+}
+
+function openSavedMenu() {
+  const menu = document.getElementById('sqMenu');
+  const trigger = document.getElementById('sqTriggerBtn');
+  if (!menu) return;
+  menu.hidden = false;
+  if (trigger) trigger.setAttribute('aria-expanded', 'true');
+}
+function closeSavedMenu() {
+  const menu = document.getElementById('sqMenu');
+  const trigger = document.getElementById('sqTriggerBtn');
+  if (!menu) return;
+  menu.hidden = true;
+  if (trigger) trigger.setAttribute('aria-expanded', 'false');
+}
+function toggleSavedMenu() {
+  const menu = document.getElementById('sqMenu');
+  if (!menu) return;
+  if (menu.hidden) openSavedMenu(); else closeSavedMenu();
 }
 
 function getTablePickerEntries(searchTerm, includeCustom) {
@@ -416,6 +865,8 @@ function selectViewerTable(tableId) {
   viewerState.lookupOptions = {};
   viewerState.lastRows = [];
   viewerState.currentPage = 1;
+  viewerState.columnView = 'default';
+  viewerState.cachedProfiles = null;
   document.getElementById('viewerQuickFilter').value = '';
   const ribEl = document.getElementById('resultsInfoBar');
   if (ribEl) ribEl.style.display = 'none';
@@ -439,14 +890,121 @@ function renderRecordViewer() {
   const table = TABLES[tableId];
   const columns = getViewerColumns(tableId);
   const pkColumns = Object.entries(table.columns).filter(([, col]) => col.pk).map(([name]) => name);
+  const totalCols = sqlQueryableColumns(table).length;
+  const view = viewerState.columnView || 'default';
+  const profiles = Array.isArray(viewerState.cachedProfiles) ? viewerState.cachedProfiles : [];
+  const supportsProfiles = !!TABLE_TO_VIEWCOLUMN_ENTITY[tableId];
+
+  // Column view picker — replaces the old "Show all" toggle. Lists the
+  // built-in views (Recommended top-N, All columns) and any Halo profiles
+  // for this table's entity. Built-in options use distinct names so they
+  // don't collide with Halo's own "Default Columns" profile.
+  const buildPickerHtml = () => {
+    const opts = [];
+    opts.push('<optgroup label="HaloPlus">');
+    opts.push(`<option value="default"${view === 'default' ? ' selected' : ''}>Recommended (top ${Math.min(VIEWER_DEFAULT_COLUMN_CAP, totalCols)})</option>`);
+    if (totalCols > VIEWER_DEFAULT_COLUMN_CAP) {
+      opts.push(`<option value="all"${view === 'all' ? ' selected' : ''}>All ${totalCols} columns</option>`);
+    }
+    opts.push('</optgroup>');
+    if (profiles.length) {
+      opts.push('<optgroup label="Halo column profiles">');
+      profiles.forEach(p => {
+        const val = 'profile:' + p.id;
+        opts.push(`<option value="${escapeHtml(val)}"${view === val ? ' selected' : ''}>${escapeHtml(p.name)}</option>`);
+      });
+      opts.push('</optgroup>');
+    } else if (supportsProfiles && viewerState.cachedProfiles === null) {
+      opts.push('<optgroup label="Halo column profiles"><option value="" disabled>Loading…</option></optgroup>');
+    }
+    return `<select class="record-cols-select" id="recordColsSelect" title="Column view">${opts.join('')}</select>`;
+  };
 
   document.getElementById('recordHeader').innerHTML = `
     <div>
-      <div class="record-title">${escapeHtml(table.label)}</div>
+      <div class="record-title-row">
+        <span class="record-title">${escapeHtml(table.label)}</span>
+        <button class="record-schema-link" type="button" id="recordViewSchemaBtn" title="Open this table in the Schema explorer">View schema &rarr;</button>
+      </div>
       <div class="record-subtitle">${escapeHtml(tableId)}${table.description ? ` - ${escapeHtml(table.description)}` : ''}</div>
     </div>
-    <div class="record-count">${Object.keys(table.columns).length} columns</div>
+    <div class="record-header-right">
+      ${buildPickerHtml()}
+      <div class="record-count">${columns.length} of ${totalCols}</div>
+    </div>
   `;
+
+  const colsSelect = document.getElementById('recordColsSelect');
+  if (colsSelect) {
+    colsSelect.addEventListener('change', () => {
+      const hadResults = viewerState.lastRows && viewerState.lastRows.length;
+      viewerState.columnView = colsSelect.value;
+      // Verbose diagnostic — built in the panel, but forwarded to the
+      // content script so it logs in the Halo page console (which the
+      // user has open). The side panel's own console is hidden behind
+      // chrome://extensions → Inspect views: panel.html, which is
+      // awkward to find.
+      try {
+        if (colsSelect.value.startsWith('profile:')) {
+          const id = colsSelect.value.slice(8);
+          const p = (viewerState.cachedProfiles || []).find(x => String(x.id) === id);
+          const tbl = TABLES[viewerState.tableId];
+          const lines = [];
+          lines.push('========== [HaloPlus] profile selection diagnostic ==========');
+          lines.push('tableId: ' + viewerState.tableId);
+          lines.push('profile picked: ' + (p ? p.name : '(NOT FOUND in cache)'));
+          lines.push('profile id: ' + id);
+          lines.push('cachedProfiles count: ' + (viewerState.cachedProfiles || []).length);
+          if (p) {
+            lines.push('profile columns:');
+            p.columns.forEach(pc => {
+              const r = resolveProfileColumnToSql(viewerState.tableId, pc.name);
+              lines.push('  ' + pc.name + ' -> ' +
+                (r ? (r.name + ' (' + (r.col.apiAlias === pc.name ? 'apiAlias' : 'direct/curated') + ')') : 'UNRESOLVED') +
+                ' | label: ' + (pc.label || '(none)'));
+            });
+          }
+          if (tbl) {
+            const sqlCols = Object.entries(tbl.columns).filter(([, c]) => c.type !== 'api');
+            const apiCols = Object.entries(tbl.columns).filter(([, c]) => c.type === 'api');
+            lines.push('SQL columns: ' + sqlCols.length);
+            lines.push('SQL sample: ' + JSON.stringify(sqlCols.slice(0, 20).map(([n, c]) => ({ sql: n, apiAlias: c.apiAlias || '' }))));
+            lines.push('API-only rows: ' + apiCols.length + ' — ' + JSON.stringify(apiCols.slice(0, 30).map(([n]) => n)));
+            lines.push('Curated API->SQL map: ' + JSON.stringify((typeof API_TO_SQL_NAME === 'object' && API_TO_SQL_NAME[viewerState.tableId]) || null));
+          }
+          lines.push('=============================================================');
+          const text = lines.join('\n');
+          // Send to content script so it logs to the Halo page console.
+          try { chrome.runtime.sendMessage({ type: 'HU_PANEL_LOG', data: { text } }); } catch (_) {}
+        }
+      } catch (e) {
+        try { chrome.runtime.sendMessage({ type: 'HU_PANEL_LOG', data: { text: '[HaloPlus] diagnostic threw: ' + (e && e.message || e) } }); } catch (_) {}
+      }
+      renderRecordViewer();
+      if (hadResults) buildViewerSQL({ run: true });
+    });
+  }
+
+  // Lazy-load Halo profiles on first render of a supported table.
+  if (supportsProfiles && viewerState.cachedProfiles === null) {
+    loadColumnProfilesForCurrentTable().then(list => {
+      // Guard against the user having switched tables while the request
+      // was in flight.
+      if (viewerState.tableId !== tableId) return;
+      viewerState.cachedProfiles = list;
+      renderRecordViewer();
+    });
+  }
+  const viewSchemaBtn = document.getElementById('recordViewSchemaBtn');
+  if (viewSchemaBtn) {
+    viewSchemaBtn.addEventListener('click', () => {
+      switchToTab('sql-helper');
+      // jumpToSchemaTarget already clears any active filter, opens the
+      // table block, and scrolls it into view; passing no column means
+      // no per-column flash, just the table-level focus.
+      jumpToSchemaTarget(tableId);
+    });
+  }
 
   document.getElementById('filterPanel').style.display = '';
   const ribEl = document.getElementById('resultsInfoBar');
@@ -456,12 +1014,21 @@ function renderRecordViewer() {
   const tableEl = el('table', { class: 'record-table' });
   const thead = el('thead');
   const headRow = el('tr');
-  columns.forEach(({ name, col }) => {
+  columns.forEach(({ name, col, virtual }) => {
     const th = el('th');
-    th.innerHTML = `
-      <span class="rt-label">${escapeHtml(col.label)}</span>
-      <span class="rt-name">${escapeHtml(name)}${pkColumns.includes(name) ? ' PK' : ''}</span>
-    `;
+    if (virtual) {
+      th.classList.add('record-th-virtual');
+      th.title = 'Computed display column in Halo — not available via SQL.';
+      th.innerHTML = `
+        <span class="rt-label">${escapeHtml(col.label)}</span>
+        <span class="rt-name">computed</span>
+      `;
+    } else {
+      th.innerHTML = `
+        <span class="rt-label">${escapeHtml(col.label)}</span>
+        <span class="rt-name">${escapeHtml(name)}${pkColumns.includes(name) ? ' PK' : ''}</span>
+      `;
+    }
     headRow.appendChild(th);
   });
   thead.appendChild(headRow);
@@ -483,19 +1050,75 @@ function renderRecordViewer() {
   buildViewerSQL();
 }
 
+// API-only rows (from the sample-record harvest or /api/ViewColumns) carry
+// `type: 'api'` and don't correspond to real SQL columns. Every Data Viewer
+// path that builds or filters SQL has to skip them — otherwise the
+// generated query references non-existent columns like `id` or `summary`
+// (which only exist on the API side) and Halo returns no rows.
+function sqlQueryableColumns(table) {
+  if (!table || !table.columns) return [];
+  return Object.entries(table.columns).filter(([, col]) => col && col.type !== 'api');
+}
+
+// Cap how many columns we show by default. Some tables (faults) have 100+
+// queryable columns and rendering all of them makes the table unreadable
+// in the side panel's narrow column. The user can flip the
+// `showAllColumns` toggle in the record header to see every column.
+const VIEWER_DEFAULT_COLUMN_CAP = 8;
+
 function getViewerColumns(tableId) {
   const table = TABLES[tableId];
-  const entries = Object.entries(table.columns || {});
+  const entries = sqlQueryableColumns(table);
+  const view = viewerState.columnView || 'default';
+
+  if (view === 'all') {
+    return entries.map(([name, col], index) => ({ name, col, index }));
+  }
+
+  // Halo profile selection: 'profile:<id>'. Map each profile column from
+  // its API name to the actual SQL column we can SELECT. Columns that
+  // can't be mapped (computed display fields Halo synthesises in its
+  // UI: Flags, Viewing, SLA Time Left, Status Icon, etc.) are rendered
+  // as virtual columns with empty cells so the profile's structure
+  // still matches what the user sees in Halo's own list view.
+  if (view.startsWith('profile:') && Array.isArray(viewerState.cachedProfiles)) {
+    const profileId = view.slice('profile:'.length);
+    const profile = viewerState.cachedProfiles.find(p => String(p.id) === profileId);
+    if (profile && profile.columns.length) {
+      const ordered = profile.columns.slice().sort((a, b) => (a.order || 0) - (b.order || 0));
+      const allOut = [];
+      ordered.forEach((pc, i) => {
+        const r = resolveProfileColumnToSql(tableId, pc.name);
+        if (r) {
+          allOut.push({ name: r.name, col: r.col, index: i });
+        } else {
+          // Virtual placeholder — not in SQL SELECT, but mirrors Halo's profile layout.
+          allOut.push({
+            name: pc.name,
+            col: {
+              type: 'computed',
+              label: pc.label || pc.name,
+              virtual: true
+            },
+            index: i,
+            virtual: true
+          });
+        }
+      });
+      if (allOut.length) return allOut;
+    }
+  }
+
+  // Default heuristic: pick the top-N most useful columns by score.
   const scored = entries.map(([name, col], index) => ({
     name,
     col,
     index,
     score: scoreViewerColumn(name, col)
   }));
-
   return scored
     .sort((a, b) => b.score - a.score || a.index - b.index)
-    .slice(0, 8)
+    .slice(0, VIEWER_DEFAULT_COLUMN_CAP)
     .sort((a, b) => a.index - b.index);
 }
 
@@ -510,6 +1133,287 @@ function scoreViewerColumn(name, col) {
   return score;
 }
 
+
+// CF discovery via /api/FieldInfo (admin-gated, content-script proxies the call).
+// Each entity's typeid maps to the SQL table where the CFs effectively appear
+// in queries — Halo stores them either as columns on the main entity table or
+// in a join table depending on `new_storage_method`, but the schema explorer
+// shows them as if attached to the entity's main table.
+const CF_ENTITY_TO_TABLE = {
+  ticket:   'faults',
+  user:     'users',
+  customer: 'area',
+  site:     'site',
+  asset:    'device',
+  supplier: 'company'
+};
+
+async function loadCachedFieldInfoCFs() {
+  return new Promise(resolve => {
+    chrome.storage.local.get(['huFieldInfoCFs'], data => {
+      if (chrome.runtime.lastError) { resolve(null); return; }
+      const payload = data.huFieldInfoCFs;
+      if (payload && payload.byEntity) mergeFieldInfoCFs(payload.byEntity);
+      resolve(payload || null);
+    });
+  });
+}
+
+async function refreshFieldInfoCFs() {
+  return new Promise(resolve => {
+    chrome.runtime.sendMessage({ type: 'HU_GET_FIELDINFO' }, response => {
+      if (chrome.runtime.lastError || !response?.ok) {
+        resolve(null);
+        return;
+      }
+      const byEntity = response.data || {};
+      const payload = { byEntity, fetchedAt: new Date().toISOString() };
+      chrome.storage.local.set({ huFieldInfoCFs: payload });
+      mergeFieldInfoCFs(byEntity);
+      resolve(payload);
+    });
+  });
+}
+
+function mergeFieldInfoCFs(byEntity) {
+  if (!byEntity || typeof byEntity !== 'object') return;
+  Object.entries(byEntity).forEach(([entity, cfs]) => {
+    const tableId = CF_ENTITY_TO_TABLE[entity];
+    if (!tableId || !TABLES[tableId] || !Array.isArray(cfs)) return;
+    cfs.forEach(cf => {
+      if (!cf || !cf.name) return;
+      // Standard column wins on collision — don't overwrite the canonical
+      // definition with the CF version.
+      if (TABLES[tableId].columns[cf.name]) return;
+      TABLES[tableId].columns[cf.name] = {
+        type: 'cf',
+        label: cf.label || cf.name,
+        cf: true,
+        cfHint: cf.hint || '',
+        cfVariable: cf.variable_name || '',
+        cfTab: cf.tab_name || '',
+        cfGroup: cf.groupname || '',
+        cfValues: Array.isArray(cf.values) ? cf.values : [],
+        cfTickettypes: Array.isArray(cf.tickettypes) ? cf.tickettypes : []
+      };
+    });
+  });
+}
+
+// Curated API-name → SQL-column mapping. Halo's REST API translates many
+// legacy SQL columns to friendlier names (`Symptom` → `summary`, `FFlowID`
+// → `workflow_id`, etc.). There's no endpoint that exposes this mapping;
+// it's compiled into Halo's frontend. We mirror the common ones here so the
+// schema explorer merges the two naming worlds into a single row instead
+// of showing them as duplicates.
+//
+// If a mapping turns out wrong, fix the entry here — failure mode is a
+// dud cross-link, not a crash.
+const API_TO_SQL_NAME = {
+  faults: {
+    'id': 'Faultid',
+    'summary': 'Symptom',
+    'details': 'Symptom2',
+    'status_id': 'Status',
+    'priority_id': 'Seriousness',
+    'dateoccurred': 'DateOccured',
+    'datecreated': 'DateCreated',
+    'dateclosed': 'DateCleared',
+    'datecleared': 'DateCleared',
+    'fixbydate': 'FixByDate',
+    'user_id': 'UserID',
+    'user_name': 'Username',
+    'client_id': 'Areaint',
+    'site_id': 'SiteNumber',
+    'agent_id': 'AssignedToInt',
+    'team_id': 'Sectio_',
+    'tickettype_id': 'RequestTypeNew',
+    'category_1': 'Category2',
+    'category_2': 'Category3',
+    'category_3': 'Category4',
+    'category_4': 'Category5',
+    'workflow_id': 'FFlowID',
+    'phonenumber': 'PhoneNumber',
+    'sla_id': 'SLAID',
+    'slastate': 'SLAState',
+    'showforusers': 'ShowOnWeb',
+    'supplier': 'Supplier'
+  },
+  users: {
+    'id':           'uid',
+    'name':         'UUsername',
+    'firstname':    'Ufirstname',
+    'surname':      'Usurname',
+    'initials':     'Uinitials',
+    'emailaddress': 'UEmail',
+    'mobile':       'UMobile',
+    'phonenumber':  'Uextn',
+    'extn':         'Uextn',
+    'site_id':      'Usite',
+    'client_id':    'UArea',
+    'jobtitle':     'UJobtitle',
+    'login':        'ULogin',
+    'notes':        'UNotes',
+    'isinactive':   'UInactive',
+    'inactive':     'UInactive',
+    'other1':       'Uother1',
+    'other2':       'Uother2',
+    'other3':       'Uother3',
+    'other4':       'Uother4',
+    'other5':       'Uother5'
+  }
+};
+
+// API-record harvest — fetches one sample record per entity via the content
+// script and adds the response's top-level keys as columns in the schema
+// explorer. Bridges the SQL/API naming gap: SQL might have `FFlowID` while
+// the API exposes `workflow_id` — both end up findable.
+const ENTITY_SAMPLE_TO_TABLE = {
+  ticket:   'faults',
+  user:     'users',
+  customer: 'area',
+  site:     'site',
+  asset:    'device',
+  supplier: 'company',
+  agent:    'uname'
+};
+
+async function loadCachedApiFieldKeys() {
+  return new Promise(resolve => {
+    chrome.storage.local.get(['huApiFieldKeys'], data => {
+      if (chrome.runtime.lastError) { resolve(null); return; }
+      const payload = data.huApiFieldKeys;
+      if (payload && payload.byEntity) mergeApiFieldKeys(payload.byEntity);
+      resolve(payload || null);
+    });
+  });
+}
+
+async function refreshApiFieldKeys() {
+  return new Promise(resolve => {
+    chrome.runtime.sendMessage({ type: 'HU_GET_ENTITY_SAMPLES' }, response => {
+      if (chrome.runtime.lastError || !response?.ok) {
+        resolve(null);
+        return;
+      }
+      const byEntity = response.data || {};
+      // Don't overwrite cache with empty data — if every entity returned []
+      // (e.g. transient auth failure), keep the previous good snapshot.
+      const total = Object.values(byEntity).reduce((n, a) => n + (Array.isArray(a) ? a.length : 0), 0);
+      if (total === 0) { resolve(null); return; }
+      const payload = { byEntity, fetchedAt: new Date().toISOString() };
+      chrome.storage.local.set({ huApiFieldKeys: payload });
+      mergeApiFieldKeys(byEntity);
+      resolve(payload);
+    });
+  });
+}
+
+function mergeApiFieldKeys(byEntity) {
+  if (!byEntity || typeof byEntity !== 'object') return;
+  Object.entries(byEntity).forEach(([entity, keys]) => {
+    const tableId = ENTITY_SAMPLE_TO_TABLE[entity];
+    if (!tableId || !TABLES[tableId] || !Array.isArray(keys)) return;
+    const mapping = API_TO_SQL_NAME[tableId] || {};
+    keys.forEach(key => {
+      if (!key) return;
+      // Same name on both sides — annotate, don't duplicate.
+      if (TABLES[tableId].columns[key]) {
+        if (!TABLES[tableId].columns[key].apiAlias) {
+          TABLES[tableId].columns[key].apiAlias = key;
+        }
+        TABLES[tableId].columns[key].api = true;
+        return;
+      }
+      // Curated mapping says this API name corresponds to an existing SQL
+      // column — annotate the SQL column with the API alias.
+      const sqlName = mapping[key];
+      if (sqlName && TABLES[tableId].columns[sqlName]) {
+        TABLES[tableId].columns[sqlName].apiAlias = key;
+        TABLES[tableId].columns[sqlName].api = true;
+        return;
+      }
+      // No mapping and no collision — this is an API-only field. Add it as
+      // a new row with the API badge.
+      TABLES[tableId].columns[key] = {
+        type: 'api',
+        label: key,
+        api: true
+      };
+    });
+  });
+}
+
+// ViewColumns harvest — fetches saved-view column metadata so the schema
+// explorer can label API fields with their list-grid titles. Closes the
+// long-standing gap where API field names like `last_update` showed up
+// without their friendly "Last Updated" label.
+async function loadCachedViewColumnLabels() {
+  return new Promise(resolve => {
+    chrome.storage.local.get(['huViewColumnLabels'], data => {
+      if (chrome.runtime.lastError) { resolve(null); return; }
+      const payload = data.huViewColumnLabels;
+      if (payload && payload.byEntity) mergeViewColumnLabels(payload.byEntity);
+      resolve(payload || null);
+    });
+  });
+}
+
+async function refreshViewColumnLabels() {
+  return new Promise(resolve => {
+    chrome.runtime.sendMessage({ type: 'HU_GET_VIEW_COLUMNS' }, response => {
+      if (chrome.runtime.lastError || !response?.ok) {
+        resolve(null);
+        return;
+      }
+      const byEntity = response.data || {};
+      // Don't overwrite cache with empty data (transient auth blip etc).
+      const total = Object.values(byEntity).reduce((n, m) => n + (m && typeof m === 'object' ? Object.keys(m).length : 0), 0);
+      if (total === 0) { resolve(null); return; }
+      const payload = { byEntity, fetchedAt: new Date().toISOString() };
+      chrome.storage.local.set({ huViewColumnLabels: payload });
+      mergeViewColumnLabels(byEntity);
+      resolve(payload);
+    });
+  });
+}
+
+function mergeViewColumnLabels(byEntity) {
+  if (!byEntity || typeof byEntity !== 'object') return;
+  Object.entries(byEntity).forEach(([entity, labels]) => {
+    const tableId = ENTITY_SAMPLE_TO_TABLE[entity];
+    if (!tableId || !TABLES[tableId] || !labels) return;
+    const mapping = API_TO_SQL_NAME[tableId] || {};
+    Object.entries(labels).forEach(([apiName, label]) => {
+      const trimmed = (label || '').trim();
+      // Existing column with the same key — annotate.
+      if (TABLES[tableId].columns[apiName]) {
+        const col = TABLES[tableId].columns[apiName];
+        if (trimmed && !col.viewLabel) col.viewLabel = trimmed;
+        if (!col.apiAlias) col.apiAlias = apiName;
+        col.api = true;
+        return;
+      }
+      // Curated mapping puts this API name on a SQL column.
+      const sqlName = mapping[apiName];
+      if (sqlName && TABLES[tableId].columns[sqlName]) {
+        const col = TABLES[tableId].columns[sqlName];
+        if (trimmed && !col.viewLabel) col.viewLabel = trimmed;
+        col.apiAlias = apiName;
+        col.api = true;
+        return;
+      }
+      // Otherwise this is a renderable API field we didn't know about. Add.
+      TABLES[tableId].columns[apiName] = {
+        type: 'api',
+        label: trimmed || apiName,
+        viewLabel: trimmed || '',
+        api: true,
+        apiAlias: apiName
+      };
+    });
+  });
+}
 
 function mergeCustomSchema(customTables, extraColumns) {
   Object.entries(customTables || {}).forEach(([tableId, def]) => {
@@ -566,13 +1470,22 @@ async function refreshSchema() {
         }
       });
 
-      const payload = { customTables, extraColumns, lastRefreshed: new Date().toISOString() };
-      chrome.storage.local.set({ huCustomSchema: payload });
-      mergeCustomSchema(customTables, extraColumns);
+      const extraColumnsCount = Object.values(extraColumns).reduce((n, c) => n + Object.keys(c).length, 0);
+      const customTablesCount = Object.keys(customTables).length;
+
+      // Empty-result safety net: if Halo's /api/Report restricts
+      // INFORMATION_SCHEMA on this tenant (returns 0 rows), don't clobber
+      // a previously-good cache with empty data. Only persist when there's
+      // actual discovery.
+      if (extraColumnsCount > 0 || customTablesCount > 0) {
+        const payload = { customTables, extraColumns, lastRefreshed: new Date().toISOString() };
+        chrome.storage.local.set({ huCustomSchema: payload });
+        mergeCustomSchema(customTables, extraColumns);
+      }
 
       resolve({
-        customTablesCount: Object.keys(customTables).length,
-        extraColumnsCount: Object.values(extraColumns).reduce((n, c) => n + Object.keys(c).length, 0),
+        customTablesCount,
+        extraColumnsCount,
         totalRows: rows.length
       });
     });
@@ -625,6 +1538,17 @@ function setupViewerEvents() {
     renderDataViewer();
   });
 
+  const saveBtn = document.getElementById('saveQueryBtn');
+  if (saveBtn) saveBtn.addEventListener('click', () => {
+    closeSavedMenu();
+    saveCurrentQuery();
+  });
+  const sqTrigger = document.getElementById('sqTriggerBtn');
+  if (sqTrigger) sqTrigger.addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleSavedMenu();
+  });
+
   document.addEventListener('click', e => {
     if (!e.target.closest('#tablePickerWrap')) closePicker();
     if (!e.target.closest('#exportWrap')) {
@@ -632,10 +1556,19 @@ function setupViewerEvents() {
       if (ew) ew.classList.remove('open');
     }
   });
+  // Saved-menu outside-click — uses `mousedown` so it fires before any
+  // sibling `click` handler can stopPropagation (the table picker trigger
+  // and clear button both stop propagation on click, which would
+  // otherwise prevent the saved menu from closing when the user clicks
+  // them).
+  document.addEventListener('mousedown', e => {
+    if (!e.target.closest('.viewer-saved-section')) closeSavedMenu();
+  });
 
   document.getElementById('addViewerFilterBtn').addEventListener('click', () => {
     if (!viewerState.tableId) return;
-    const firstColumn = Object.keys(TABLES[viewerState.tableId].columns)[0];
+    const firstColumn = sqlQueryableColumns(TABLES[viewerState.tableId])[0]?.[0];
+    if (!firstColumn) return;
     viewerState.filters.push({ connector: 'AND', column: firstColumn, operator: '=', value: '' });
     renderViewerFilters();
   });
@@ -786,7 +1719,7 @@ function renderViewerFilters() {
     if (index === 0) connectorSelect.style.visibility = 'hidden';
 
     const columnSelect = el('select', { class: 'sn-field' });
-    Object.entries(TABLES[viewerState.tableId].columns).forEach(([name, col]) => {
+    sqlQueryableColumns(TABLES[viewerState.tableId]).forEach(([name, col]) => {
       const opt = el('option', { value: name }, `${col.label} (${name})`);
       if (name === filter.column) opt.selected = true;
       columnSelect.appendChild(opt);
@@ -1012,10 +1945,13 @@ function buildViewerSQL(options = {}) {
   const table = TABLES[tableId];
   const alias = table.alias || tableId;
   const columns = getViewerColumns(tableId);
+  // Virtual columns (Halo's computed display fields) aren't selectable;
+  // strip them before building the SELECT list.
+  const sqlColumns = columns.filter(c => !c.virtual && c.col && c.col.type !== 'computed');
   const parts = ['SELECT TOP 10000'];
 
-  parts.push(columns.map(({ name, col }, index) => {
-    const comma = index < columns.length - 1 ? ',' : '';
+  parts.push(sqlColumns.map(({ name, col }, index) => {
+    const comma = index < sqlColumns.length - 1 ? ',' : '';
     let expr = `${alias}.${name}`;
     if (String(col.type).includes('ntext')) {
       expr = `CONVERT(nvarchar(max), ${expr})`;
@@ -1076,7 +2012,7 @@ function buildViewerWhere(alias, table) {
 
   const quickFilter = document.getElementById('viewerQuickFilter')?.value.trim();
   if (quickFilter) {
-    const textCols = Object.entries(table.columns)
+    const textCols = sqlQueryableColumns(table)
       .filter(([, col]) => /(char|text|varchar)/i.test(col.type))
       .slice(0, 6)
       .map(([name]) => `${alias}.${name} LIKE '%${escapeSql(quickFilter)}%'`);
@@ -1133,7 +2069,7 @@ function isNumericType(type) {
 }
 
 function getDefaultOrderColumn(table) {
-  const entries = Object.entries(table.columns);
+  const entries = sqlQueryableColumns(table);
   const dateCol = entries.find(([name, col]) => /date|time|whe_|occured|created/i.test(`${name} ${col.label}`));
   if (dateCol) return dateCol[0];
   const pkCol = entries.find(([, col]) => col.pk);
@@ -1415,19 +2351,28 @@ function renderRecordRows(rows, rawPayload) {
 
   if (!rows.length) {
     const empty = el('div', { class: 'empty-state compact' });
-    empty.innerHTML = '<div class="es-text">Halo responded, but no record rows were found. Open DevTools for the side panel and check the HaloPlus report response log.</div>';
+    empty.innerHTML = '<div class="es-text">Halo responded, but no record rows were found.</div>';
     wrap.appendChild(empty);
-    console.debug('HaloPlus report response', rawPayload);
     return;
   }
 
-  const columns = Object.keys(rows[0]);
+  // Build the header from the same column list displayPagedRows uses, so
+  // header and body always have matching cell counts. This includes any
+  // virtual (computed) columns from a Halo profile — they get a header
+  // labelled with the profile's column name and the body renders "—".
+  const viewerCols = viewerState.tableId ? getViewerColumns(viewerState.tableId) : [];
   const tableEl = el('table', { class: 'record-table live-records' });
   const thead = el('thead');
   const headRow = el('tr');
-  columns.forEach(column => {
+  viewerCols.forEach(vc => {
     const th = el('th');
-    th.innerHTML = `<span class="rt-label">${escapeHtml(column)}</span>`;
+    if (vc.virtual) {
+      th.classList.add('record-th-virtual');
+      th.title = 'Computed display column in Halo — not available via SQL.';
+      th.innerHTML = `<span class="rt-label">${escapeHtml(vc.col.label)}</span><span class="rt-name">computed</span>`;
+    } else {
+      th.innerHTML = `<span class="rt-label">${escapeHtml(vc.col.label || vc.name)}</span>`;
+    }
     headRow.appendChild(th);
   });
   thead.appendChild(headRow);
@@ -1453,9 +2398,12 @@ function displayPagedRows() {
   const end = Math.min(start + pageSize, rows.length);
   const pageRows = rows.slice(start, end);
 
-  const columns = Object.keys(rows[0]);
+  // Iterate the viewer columns (which include virtual placeholders for
+  // Halo's computed display fields). Each row's data is keyed by the
+  // column label used in the SQL alias. Virtual columns get an empty
+  // cell since they aren't in the SELECT.
   const viewerCols = viewerState.tableId ? getViewerColumns(viewerState.tableId) : [];
-  const pkViewerCol = viewerCols.find(vc => vc.col.pk);
+  const pkViewerCol = viewerCols.find(vc => vc.col && vc.col.pk);
   const tableRoute = TABLE_ROUTES[viewerState.tableId];
   const canNavigate = !!(pkViewerCol && tableRoute);
 
@@ -1470,9 +2418,15 @@ function displayPagedRows() {
         tr.addEventListener('click', () => navigateHaloRecord(tableRoute(pkValue)));
       }
     }
-    columns.forEach(column => {
+    viewerCols.forEach(vc => {
       const td = el('td');
-      td.textContent = formatCell(row[column]);
+      if (vc.virtual) {
+        td.classList.add('record-cell-virtual');
+        td.textContent = '—';
+        td.title = 'Computed display column in Halo — not available via SQL.';
+      } else {
+        td.textContent = formatCell(row[vc.col.label]);
+      }
       tr.appendChild(td);
     });
     tbody.appendChild(tr);
@@ -1697,6 +2651,83 @@ function setupSearch() {
   if (schemaSearch) {
     schemaSearch.addEventListener('input', (e) => renderSchemaExplorer(e.target.value));
   }
+  setupSchemaPerspective();
+
+  // Delegated handler for FK chip clicks — jump to the referenced table.
+  const schemaList = document.getElementById('schemaList');
+  if (schemaList) {
+    schemaList.addEventListener('click', (e) => {
+      const fkChip = e.target.closest('.sc-fk-clickable');
+      if (!fkChip) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const fk = fkChip.dataset.fk || '';
+      const [tableId, columnName] = fk.split('.');
+      jumpToSchemaTarget(tableId, columnName);
+    });
+  }
+}
+
+// Bridge from Schema explorer → Data Viewer. Seeds the viewer with the
+// clicked table and switches tabs in one go so users don't have to pick it
+// again. Falls back to a no-op when the Data Viewer is hidden by report-
+// API gating; in that case the user shouldn't see the Query button either
+// because both tabs hide together.
+function openTableInDataViewer(tableId) {
+  if (!tableId || !TABLES[tableId]) return;
+  const dataTab = document.querySelector('.tab[data-tab="data-viewer"]');
+  if (dataTab && dataTab.classList.contains('hidden-no-report-access')) return;
+  selectViewerTable(tableId);
+  switchToTab('data-viewer');
+}
+
+function jumpToSchemaTarget(tableId, columnName) {
+  if (!tableId || !TABLES[tableId]) return;
+  // Make sure the Schema tab is active so the user actually sees the jump.
+  const schemaTabBtn = document.querySelector('[data-tab="schema"]');
+  if (schemaTabBtn && !schemaTabBtn.classList.contains('active')) {
+    schemaTabBtn.click();
+  }
+  // Clear any active filter so the target table is guaranteed visible.
+  const schemaSearch = document.getElementById('schemaSearch');
+  if (schemaSearch && schemaSearch.value) {
+    schemaSearch.value = '';
+    renderSchemaExplorer('');
+  }
+  // Find the rendered table block by its name span text.
+  const blocks = document.querySelectorAll('#schemaList .schema-table');
+  let targetBlock = null;
+  blocks.forEach(block => {
+    const nameEl = block.querySelector('.st-name');
+    if (nameEl && nameEl.textContent.trim() === tableId) targetBlock = block;
+  });
+  if (!targetBlock) return;
+  targetBlock.classList.add('open');
+  targetBlock.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  // Highlight the referenced column briefly so the user can spot it.
+  if (columnName) {
+    const colRows = targetBlock.querySelectorAll('.schema-col');
+    colRows.forEach(row => {
+      const nameEl = row.querySelector('.sc-name');
+      if (nameEl && nameEl.textContent.trim() === columnName) {
+        row.classList.add('sc-flash');
+        setTimeout(() => row.classList.remove('sc-flash'), 1600);
+      }
+    });
+  }
+}
+
+function setupSchemaPerspective() {
+  const buttons = document.querySelectorAll('.schema-perspective-btn');
+  if (!buttons.length) return;
+  const search = document.getElementById('schemaSearch');
+  buttons.forEach(btn => {
+    btn.addEventListener('click', () => {
+      schemaPerspective = btn.dataset.mode || 'both';
+      buttons.forEach(b => { b.dataset.active = String(b.dataset.mode === schemaPerspective); });
+      renderSchemaExplorer(search?.value || '');
+    });
+  });
 }
 
 function updateContextBadge(ctx) {
@@ -1712,6 +2743,43 @@ function updateContextBadge(ctx) {
     badge.textContent = '--';
     badge.title = 'Active page context';
   }
+}
+
+function updateEnvPill(envKind, host, customLabel) {
+  const pill = document.getElementById('envPill');
+  if (!pill) return;
+  if (!envKind) {
+    pill.style.display = 'none';
+    return;
+  }
+  const spec = (typeof HU_ENVIRONMENT_SPECS !== 'undefined' && HU_ENVIRONMENT_SPECS[envKind])
+    || { label: envKind.toUpperCase(), color: '#64748b', bg: '#e2e8f0', text: '#334155' };
+  pill.style.display = '';
+  pill.style.background = spec.bg;
+  pill.style.color = spec.text;
+  pill.style.borderColor = spec.color;
+  pill.textContent = (customLabel && String(customLabel).trim()) || spec.label;
+  pill.title = `Environment: ${spec.label}${host ? ' · ' + host : ''}` +
+               (envKind === 'prod' ? '\nChanges affect the real system.' : '');
+}
+
+function updateEnvPillForUrl(url) {
+  // Show the env pill for any Halo surface where detection finds something
+  // (auto-detected or user-overridden). Non-Halo hosts with no config stay
+  // hidden. The pill matches the in-page banner behaviour.
+  if (!url) { updateEnvPill('', ''); return; }
+  let host = '';
+  try { host = new URL(url).hostname; } catch (_) { updateEnvPill('', ''); return; }
+  if (!host) { updateEnvPill('', ''); return; }
+  const detect = typeof huDetectEnvironment === 'function' ? huDetectEnvironment : () => 'unknown';
+  chrome.storage.local.get(['huCustomDomainsMeta'], data => {
+    const meta = (data && data.huCustomDomainsMeta) || {};
+    const entry = meta[host.toLowerCase()] || {};
+    const label = typeof entry.label === 'string' ? entry.label.trim() : '';
+    const env = entry.env || detect(host);
+    if (env === 'unknown' && !label) { updateEnvPill('', ''); return; }
+    updateEnvPill(env, host, label);
+  });
 }
 
 async function refreshActiveTabState() {
@@ -1747,12 +2815,14 @@ async function refreshActiveTabState() {
 
   if (!isHaloTab) {
     updateContextBadge(null);
+    updateEnvPill('', '');
     applyHaloAvailability();
     applyContextRefreshNotice(false);
     return;
   }
 
   updateContextBadge(pageContext);
+  updateEnvPillForUrl(activeUrl);
   applyHaloAvailability();
   applyContextRefreshNotice(needsContentScriptRefresh);
 
@@ -1948,12 +3018,15 @@ function setupRegrantButton() {
 // --- Diagnostics card ---------------------------------------------------------
 
 let lastDiagnostics = null;
+let lastExtendedProbes = null;
 
 function setupDiagnostics() {
   const runBtn = document.getElementById('runDiagnosticsBtn');
   const copyBtn = document.getElementById('copyDiagnosticsBtn');
+  const probeBtn = document.getElementById('runExtendedProbesBtn');
   if (runBtn) runBtn.addEventListener('click', runDiagnostics);
   if (copyBtn) copyBtn.addEventListener('click', copyDiagnostics);
+  if (probeBtn) probeBtn.addEventListener('click', runExtendedProbes);
 }
 
 function runDiagnostics() {
@@ -1977,56 +3050,56 @@ function runDiagnostics() {
   });
 }
 
+// Friendly labels for the /api/<route> palette-search probes. Falls back to
+// a Title-cased version of the route when an entry is missing.
+const ENTITY_ROUTE_LABELS = {
+  ticket:        'Tickets',
+  client:        'Customers',
+  user:          'Users (end users)',
+  agent:         'Agents',
+  asset:         'Assets',
+  site:          'Sites',
+  supplier:      'Suppliers',
+  team:          'Teams',
+  KBArticle:     'Knowledge base',
+  invoice:       'Invoices',
+  quotation:     'Quotes',
+  purchaseorder: 'Purchase orders'
+};
+
+function friendlyRouteLabel(route) {
+  if (ENTITY_ROUTE_LABELS[route]) return ENTITY_ROUTE_LABELS[route];
+  return route.charAt(0).toUpperCase() + route.slice(1);
+}
+
 function renderDiagnostics(data) {
   const list = document.getElementById('diagList');
   if (!list) return;
   list.innerHTML = '';
 
-  list.appendChild(makeDiagGroup('Extension', [
-    diagRow('ok', 'HaloPlus version', data.extensionVersion)
-  ]));
+  // Compute an overall health verdict before rendering individual rows so we
+  // can put a clear at-a-glance banner at the top.
+  const verdict = computeDiagnosticsVerdict(data);
+  list.appendChild(makeDiagBanner(verdict));
 
-  if (!data.savedDomains || !data.savedDomains.length) {
-    list.appendChild(makeDiagGroup('Custom Halo domains', [
-      diagRow('unknown', 'No custom domains saved', 'Add one in the Domains card above if you use a non-standard Halo URL.')
-    ]));
-  } else {
-    const rows = [];
-    data.savedDomains.forEach(domain => {
-      const permResult = (data.permissionsPerDomain || []).find(p => p.match === domain) || { granted: false };
-      const isRegistered = (data.registeredMatches || []).includes(domain);
-      const displayHost = domain.replace(/^https?:\/\//, '').replace(/\/\*$/, '');
-      rows.push(diagRow(
-        permResult.granted ? 'ok' : 'bad',
-        'Chrome permission · ' + displayHost,
-        permResult.granted ? 'Granted' : 'Not granted — click Re-grant on the Halo banner above'
-      ));
-      rows.push(diagRow(
-        isRegistered ? 'ok' : 'bad',
-        'Content script registered · ' + displayHost,
-        isRegistered ? 'Registered for injection' : 'Not registered — remove and re-add this domain'
-      ));
-    });
-    list.appendChild(makeDiagGroup('Custom Halo domains', rows));
-  }
-
+  // Reorder the groups to lead with what most users actually want to see
+  // first: am I detected, what's my role, what works, what doesn't.
   const tabRows = [];
   if (data.activeTab && data.activeTab.url) {
-    tabRows.push(diagRow('ok', 'Active tab URL', data.activeTab.url));
     if (data.contentScriptReachable === true) {
-      tabRows.push(diagRow('ok', 'Content script responding', 'HaloPlus is active on this page.'));
+      tabRows.push(diagRow('ok', 'HaloPlus is connected', 'Detected this Halo tab and the page-side script is responding.'));
     } else if (data.contentScriptReachable === false) {
       const detail = data.activeTabError
-        ? 'No response — ' + data.activeTabError + '. Try reloading the tab. If that fails, the extension may not be allowed to inject on this URL.'
-        : 'No response. Try reloading the tab.';
-      tabRows.push(diagRow('bad', 'Content script responding', detail));
+        ? 'Page script not responding — ' + data.activeTabError + '. Reload the tab; if it persists the extension may not be allowed to inject on this URL.'
+        : 'Page script not responding. Reload the tab to retry.';
+      tabRows.push(diagRow('bad', 'HaloPlus is not connected', detail));
     } else {
-      tabRows.push(diagRow('unknown', 'Content script responding', 'Not checked.'));
+      tabRows.push(diagRow('unknown', 'Connection not checked', 'No active tab to check against.'));
     }
   } else {
-    tabRows.push(diagRow('warn', 'Active tab', 'No active tab detected.'));
+    tabRows.push(diagRow('warn', 'No active tab', 'Open a Halo page in this window to run diagnostics.'));
   }
-  list.appendChild(makeDiagGroup('Active tab', tabRows));
+  list.appendChild(makeDiagGroup('On this tab', tabRows));
 
   if (data.lastRegistrationError) {
     list.appendChild(makeDiagGroup('Last registration error', [
@@ -2037,51 +3110,254 @@ function renderDiagnostics(data) {
   if (data.page) {
     const p = data.page;
 
-    // Halo role / impersonation
+    // ── Your account ─────────────────────────────────────────────────
     if (p.permissions) {
       const perm = p.permissions;
-      const roleRows = [
-        diagRow(perm.isAdmin ? 'ok' : 'warn', 'Administrator', perm.isAdmin ? 'Yes — full claim set' : 'No — non-admin agent'),
-        diagRow(perm.canImpersonate ? 'ok' : 'unknown', 'Can impersonate', perm.canImpersonate ? 'Yes (Can_Impersonate_Users)' : 'No'),
-        diagRow(perm.canLogTickets ? 'ok' : 'unknown', 'Can log tickets', perm.canLogTickets ? 'Yes (Can_Log_Tickets)' : 'No'),
-        diagRow('ok', 'Total claims', String(perm.totalClaims || 0))
-      ];
+      const accountRows = [];
+      accountRows.push(diagRow(
+        perm.isAdmin ? 'ok' : 'warn',
+        'Account type',
+        perm.isAdmin ? 'Administrator — full feature set is available.' : 'Standard agent — some admin-only features will be hidden.'
+      ));
+      accountRows.push(diagRow(
+        perm.canImpersonate ? 'ok' : 'unknown',
+        'Impersonation',
+        perm.canImpersonate ? '/imp is available for your role.' : 'Not enabled for your role.'
+      ));
+      accountRows.push(diagRow(
+        perm.canLogTickets ? 'ok' : 'unknown',
+        'Logging tickets',
+        perm.canLogTickets ? 'You can create tickets via HaloPlus.' : 'Not enabled for your role.'
+      ));
       if (perm.isImpersonating) {
-        roleRows.push(diagRow('warn', 'Impersonating', `Acting as agent ${perm.currentAgentId} (real: ${perm.parentAgentId})`));
+        accountRows.push(diagRow('warn', 'Currently impersonating',
+          `Acting as agent ${perm.currentAgentId} (real agent ${perm.parentAgentId}). Use /xi to drop back.`));
+      } else if (perm.staleImpersonationMarker) {
+        accountRows.push(diagRow('unknown', 'Stale impersonation marker',
+          `Halo has a leftover "real user" id (${perm.parentAgentId}) in this tab's storage that isn't a real agent. HaloPlus is ignoring it — you're not impersonating.`));
       }
-      list.appendChild(makeDiagGroup('Halo role', roleRows));
+      list.appendChild(makeDiagGroup('Your account', accountRows));
     }
 
-    // Report API gating
-    const reportStatus = p.reportApiOk === true ? 'ok'
-                       : p.reportApiOk === false ? 'bad'
-                       : 'unknown';
-    const reportSub = p.reportApiOk === true ? 'Data Viewer and Schema work normally.'
-                    : p.reportApiOk === false ? `403 — Data Viewer and Schema are hidden${p.reportApiError ? ' (' + p.reportApiError + ')' : ''}.`
-                    : 'Not probed yet.';
-    list.appendChild(makeDiagGroup('SQL access (/api/Report)', [
-      diagRow(reportStatus, '/api/Report', reportSub)
-    ]));
+    // ── What's available for your role ───────────────────────────────
+    const featureRows = [];
 
-    // Entity API access per route
+    // SQL access — drives Data Viewer + Schema explorer
+    if (p.reportApiOk === true) {
+      featureRows.push(diagRow('ok', 'Data Viewer & SQL Schema', 'Working — you can run queries and explore the SQL schema.'));
+    } else if (p.reportApiOk === false) {
+      featureRows.push(diagRow('bad', 'Data Viewer & SQL Schema',
+        'Unavailable — your Halo role doesn\'t allow direct SQL queries. The Data Viewer tab is hidden.'));
+    } else {
+      featureRows.push(diagRow('unknown', 'Data Viewer & SQL Schema', 'Not probed yet — running this in the background.'));
+    }
+
+    // Palette searches — roll up entity-API access into one summary row + per-entity sub rows
     if (p.entityAccess) {
-      const routeRows = Object.entries(p.entityAccess).map(([route, ok]) => {
-        const status = ok === true ? 'ok' : ok === false ? 'bad' : 'unknown';
-        const sub = ok === true ? '200 — entity-API search works'
-                  : ok === false ? '401/403 — palette command will be greyed out'
-                  : 'Unknown — probe inconclusive (network or 404)';
-        return diagRow(status, '/api/' + route, sub);
-      });
-      list.appendChild(makeDiagGroup('Entity API access', routeRows));
+      const entries = Object.entries(p.entityAccess);
+      const okCount  = entries.filter(([, ok]) => ok === true).length;
+      const badCount = entries.filter(([, ok]) => ok === false).length;
+      const total    = entries.length;
+
+      let summaryStatus, summaryText;
+      if (badCount === 0) {
+        summaryStatus = 'ok';
+        summaryText = `All ${total} palette searches work for your role.`;
+      } else if (okCount === 0) {
+        summaryStatus = 'bad';
+        summaryText = 'None of the palette searches are available for your role.';
+      } else {
+        summaryStatus = 'warn';
+        summaryText = `${okCount} of ${total} palette searches work. The rest are greyed out in the palette.`;
+      }
+      featureRows.push(diagRow(summaryStatus, 'Palette searches', summaryText));
+
+      // Only show per-entity detail when something is actually restricted.
+      if (badCount > 0) {
+        entries.forEach(([route, ok]) => {
+          if (ok === true) return;
+          const label = '   · ' + friendlyRouteLabel(route);
+          const sub = ok === false ? 'Restricted for your role — greyed out in the palette.'
+                                   : 'Couldn\'t verify (network or 404).';
+          featureRows.push(diagRow(ok === false ? 'bad' : 'unknown', label, sub));
+        });
+      }
     }
 
-    // Ticket type loading
+    // Ticket types
     const ttStatus = p.ticketTypeCount > 0 ? 'ok' : 'warn';
-    const ttDetail = p.ticketTypeCount + ' types loaded · email tag pre-fetch ' + (p.ticketTypeTagsLoaded ? 'complete' : 'pending or skipped');
-    list.appendChild(makeDiagGroup('Custom ticket types', [
-      diagRow(ttStatus, 'Loaded', ttDetail)
+    const ttDetail = p.ticketTypeCount > 0
+      ? `${p.ticketTypeCount} types loaded into the palette.${p.ticketTypeTagsLoaded ? '' : ' Email tag prefixes still loading in the background.'}`
+      : 'No custom ticket types detected yet. Open the palette once to trigger loading.';
+    featureRows.push(diagRow(ttStatus, 'Custom ticket types', ttDetail));
+
+    list.appendChild(makeDiagGroup('Available features', featureRows));
+
+    // ── Custom Halo domains (only when relevant) ─────────────────────
+    if (data.savedDomains && data.savedDomains.length) {
+      const rows = [];
+      data.savedDomains.forEach(domain => {
+        const permResult = (data.permissionsPerDomain || []).find(p => p.match === domain) || { granted: false };
+        const isRegistered = (data.registeredMatches || []).includes(domain);
+        const displayHost = domain.replace(/^https?:\/\//, '').replace(/\/\*$/, '');
+        const ok = permResult.granted && isRegistered;
+        rows.push(diagRow(
+          ok ? 'ok' : 'bad',
+          displayHost,
+          ok ? 'Permission granted and content script is registered.'
+             : !permResult.granted ? 'Chrome permission not granted — click Re-grant on the Halo banner above.'
+                                   : 'Content script not registered — remove and re-add this domain.'
+        ));
+      });
+      list.appendChild(makeDiagGroup('Custom Halo domains', rows));
+    }
+
+    // ── Diagnostics footer with version (kept for support) ───────────
+    list.appendChild(makeDiagGroup('About this report', [
+      diagRow('unknown', 'HaloPlus version', data.extensionVersion || '(unknown)')
     ]));
   }
+}
+
+function computeDiagnosticsVerdict(data) {
+  // Critical: extension can't talk to a Halo tab at all
+  if (!data.activeTab || !data.activeTab.url) {
+    return { level: 'warn', headline: 'No active tab', sub: 'Open a Halo page in this window and re-run diagnostics.' };
+  }
+  if (data.contentScriptReachable === false) {
+    return { level: 'bad', headline: 'HaloPlus can\'t reach Halo on this tab', sub: 'Try reloading the tab. If the issue persists, check Custom Halo domains below.' };
+  }
+  if (data.lastRegistrationError) {
+    return { level: 'bad', headline: 'Last registration failed', sub: 'See the error in the report below.' };
+  }
+  if (!data.page) {
+    return { level: 'warn', headline: 'Couldn\'t collect page diagnostics', sub: 'Try reloading the tab and re-running.' };
+  }
+
+  const p = data.page;
+  const issues = [];
+  if (p.reportApiOk === false) issues.push('Data Viewer & SQL Schema');
+  if (p.entityAccess) {
+    const blocked = Object.values(p.entityAccess).filter(v => v === false).length;
+    if (blocked > 0) issues.push(`${blocked} palette search${blocked === 1 ? '' : 'es'}`);
+  }
+  if (p.permissions && p.permissions.staleImpersonationMarker) issues.push('a stale impersonation marker');
+
+  if (!issues.length) {
+    return { level: 'ok', headline: 'All systems go', sub: 'HaloPlus is fully operational on this tenant.' };
+  }
+  return {
+    level: 'warn',
+    headline: 'Some features are limited for your role',
+    sub: 'Unavailable: ' + issues.join(', ') + '. Details below.'
+  };
+}
+
+function makeDiagBanner(verdict) {
+  const banner = document.createElement('div');
+  banner.className = 'diag-banner diag-banner-' + verdict.level;
+  const icon = document.createElement('span');
+  icon.className = 'diag-banner-icon';
+  icon.textContent = verdict.level === 'ok' ? '✓' : verdict.level === 'bad' ? '✗' : '!';
+  const text = document.createElement('div');
+  text.className = 'diag-banner-text';
+  const head = document.createElement('span');
+  head.className = 'diag-banner-head';
+  head.textContent = verdict.headline;
+  const sub = document.createElement('span');
+  sub.className = 'diag-banner-sub';
+  sub.textContent = verdict.sub || '';
+  text.appendChild(head);
+  text.appendChild(sub);
+  banner.appendChild(icon);
+  banner.appendChild(text);
+  return banner;
+}
+
+function runExtendedProbes() {
+  const probeBtn = document.getElementById('runExtendedProbesBtn');
+  const list = document.getElementById('diagList');
+  if (!list) return;
+  if (probeBtn) { probeBtn.disabled = true; probeBtn.textContent = 'Probing…'; }
+
+  let placeholder = document.getElementById('extProbesGroup');
+  if (!placeholder) {
+    placeholder = document.createElement('div');
+    placeholder.id = 'extProbesGroup';
+    placeholder.className = 'diag-group';
+    list.appendChild(placeholder);
+  }
+  placeholder.innerHTML = '<span class="diag-group-title">Extended probes</span><div class="diag-empty">Probing 10 candidate endpoints…</div>';
+
+  chrome.runtime.sendMessage({ type: 'HU_RUN_EXTENDED_PROBES' }, response => {
+    if (probeBtn) { probeBtn.disabled = false; probeBtn.textContent = 'Run extended probes'; }
+    if (chrome.runtime.lastError || !response || !response.ok) {
+      const err = (response && response.error) || (chrome.runtime.lastError && chrome.runtime.lastError.message) || 'Unknown error';
+      placeholder.innerHTML = '<span class="diag-group-title">Extended probes</span><div class="diag-empty">Probes failed: ' + escapeHtml(err) + '</div>';
+      return;
+    }
+    lastExtendedProbes = response.data;
+    renderExtendedProbes(placeholder, response.data);
+  });
+}
+
+// Translates each probe path to a friendly feature name that's the row's
+// primary label. The technical path moves into the sub-text so the human
+// scan path is feature → status, not URL → URL.
+const EXTENDED_PROBE_LABELS = {
+  '/api/Agent/me':                                    'Your agent identity',
+  '/api/Search?search=test&count_per_entity=2':       'Universal search across entities',
+  '/api/ViewColumns?type=1':                          'Saved-view column labels',
+  '/api/tickets?count=1&includecolumns=true':         'List-grid column labels (tickets)',
+  '/api/PopupNote?showall=true':                      'Popup notes (VIP / contract warnings)',
+  '/api/FaultViewLog':                                'Ticket "viewed by" trail',
+  '/api/Notifications?count=5':                       'In-app notifications feed',
+  '/api/Feed?count=5':                                'Activity feed',
+  '/api/HaloField':                                   'Generic field metadata',
+  '/api/Field?kind=ticket':                           'Ticket field definitions'
+};
+
+function renderExtendedProbes(container, data) {
+  container.innerHTML = '';
+  const title = document.createElement('span');
+  title.className = 'diag-group-title';
+  title.textContent = 'Optional features (extended probes)';
+  container.appendChild(title);
+
+  const results = data.results || [];
+  const okCount = results.filter(r => r.status === 'ok').length;
+  const intro = document.createElement('div');
+  intro.className = 'diag-banner-sub';
+  intro.style.padding = '0 2px 6px';
+  intro.textContent = `${okCount} of ${results.length} optional features are available on this tenant + role.`;
+  container.appendChild(intro);
+
+  results.forEach(r => {
+    const featureLabel = EXTENDED_PROBE_LABELS[r.path] || r.purpose || r.path;
+    let icon;
+    let sub;
+    if (r.status === 'ok') {
+      icon = 'ok';
+      sub = `Available · responded in ${r.ms}ms`;
+    } else if (r.status === 'forbidden') {
+      icon = 'bad';
+      sub = 'Restricted — your Halo role isn\'t allowed to call this endpoint.';
+    } else if (r.status === 'unauthorized') {
+      icon = 'bad';
+      sub = 'Not authorised — re-login to Halo and try again.';
+    } else if (r.status === 'notfound') {
+      icon = 'warn';
+      sub = 'Not available on this Halo build.';
+    } else if (r.status === 'error') {
+      icon = 'warn';
+      sub = `Returned HTTP ${r.httpCode || '?'} — endpoint may be tenant-disabled.`;
+    } else {
+      icon = 'unknown';
+      sub = 'Couldn\'t verify — network or unexpected response.';
+    }
+    sub += '  ·  ' + r.path;
+    container.appendChild(diagRow(icon, featureLabel, sub));
+  });
 }
 
 function makeDiagGroup(title, rows) {
@@ -2160,6 +3436,20 @@ function formatDiagnosticsForClipboard(d) {
   if (d.activeTabError) lines.push('  error: ' + d.activeTabError);
   lines.push('');
   lines.push('Last registration error: ' + (d.lastRegistrationError || 'none'));
+  if (lastExtendedProbes && Array.isArray(lastExtendedProbes.results)) {
+    lines.push('');
+    lines.push('Extended probes (probed ' + (lastExtendedProbes.probedAt || '') + '):');
+    lastExtendedProbes.results.forEach(r => {
+      const detail = r.status === 'ok'
+        ? `200 ${r.ms}ms ${r.shape}`
+        : r.status === 'forbidden' ? '403 forbidden'
+        : r.status === 'unauthorized' ? '401 unauthorized'
+        : r.status === 'notfound' ? '404'
+        : r.status === 'error' ? `HTTP ${r.httpCode || '?'}`
+        : `inconclusive: ${(r.error || '').slice(0, 80)}`;
+      lines.push('  ' + r.path + '  →  ' + detail);
+    });
+  }
   return lines.join('\n');
 }
 
@@ -2384,60 +3674,262 @@ async function loadCustomHaloDomains() {
   return customHaloMatches;
 }
 
-function setupCustomDomainSettings() {
-  const input = document.getElementById('customHaloDomains');
-  const saveBtn = document.getElementById('saveCustomDomainsBtn');
-  const status = document.getElementById('customDomainStatus');
-  if (!input || !saveBtn) return;
+// Storage layout for the env labels. Keyed by hostname (lowercase) so a
+// single entry covers any URL match. Existing `huCustomHaloDomains` (an
+// array of match patterns) stays as the Chrome-permissions source; we
+// just layer env metadata on top.
+const DOMAINS_META_KEY = 'huCustomDomainsMeta';
 
-  loadCustomHaloDomains().then(matches => {
-    input.value = matches.map(match => match.replace(/\/\*$/, '')).join('\n');
+async function loadDomainsMeta() {
+  const data = await new Promise(r => chrome.storage.local.get([DOMAINS_META_KEY], r));
+  return (data && data[DOMAINS_META_KEY]) || {};
+}
+
+async function saveDomainsMeta(meta) {
+  await new Promise(r => chrome.storage.local.set({ [DOMAINS_META_KEY]: meta }, r));
+}
+
+function matchToHost(match) {
+  // `https://acme.com/*` → `acme.com`; tolerates wildcards like
+  // `https://*.acme.com/*` by stripping the leading `*.`.
+  try {
+    const m = String(match).replace(/^https?:\/\//, '').replace(/\/\*?$/, '');
+    return m.replace(/^\*\./, '').toLowerCase();
+  } catch (_) {
+    return '';
+  }
+}
+
+function isHaloStandardHost(host) {
+  return /\.(halopsa\.com|haloitsm\.com|haloservicedesk\.com)$/i.test(host);
+}
+
+function setupCustomDomainSettings() {
+  const addBtn       = document.getElementById('domainAddBtn');
+  const addForm      = document.getElementById('domainAddForm');
+  const addHost      = document.getElementById('domainAddHost');
+  const addEnv       = document.getElementById('domainAddEnv');
+  const addLabel     = document.getElementById('domainAddLabel');
+  const addConfirm   = document.getElementById('domainAddConfirmBtn');
+  const addCancel    = document.getElementById('domainAddCancelBtn');
+  if (!addBtn || !addForm) return;
+
+  renderDomainList();
+
+  addBtn.addEventListener('click', async () => {
+    addForm.hidden = false;
+    addBtn.hidden = true;
+    addEnv.value = '';
+    addLabel.value = '';
+    // Prefill the host from the active tab when it's a Halo page that isn't
+    // already in the user's tenant list. Saves a copy-paste step in the
+    // common "I'm here, save this as a tenant" flow.
+    addHost.value = await getPrefilledHostForAdd();
+    setTimeout(() => addHost.focus(), 30);
   });
 
-  saveBtn.addEventListener('click', async () => {
-    status.textContent = 'Saving…';
-    saveBtn.disabled = true;
+  addCancel.addEventListener('click', () => {
+    addForm.hidden = true;
+    addBtn.hidden = false;
+  });
 
-    try {
-      const matches = parseCustomHaloDomainInput(input.value);
-      if (!matches.length) {
-        await saveCustomHaloDomains([]);
-        input.value = '';
-        status.textContent = 'Custom domains cleared.';
-        return;
-      }
+  addConfirm.addEventListener('click', () => addDomain({
+    host: addHost.value,
+    env: addEnv.value,
+    label: addLabel.value
+  }));
+  addHost.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); addConfirm.click(); }
+  });
+}
 
-      // Save to storage FIRST, then request permission. Action popups (the
-      // side panel here) lose focus when Chrome's permission prompt appears
-      // and CLOSE — killing this handler mid-await. By writing storage first,
-      // the domain survives the popup death. The service worker's
-      // permissions.onAdded listener then picks up an Allow and re-registers.
-      // Snapshot the previous state so we can roll back on explicit denial.
-      const previousMatches = Array.isArray(customHaloMatches) ? customHaloMatches.slice() : [];
+// Returns the active tab's hostname when it's a Halo page (standard apex
+// or one of the user's custom-domain matches) AND hasn't already been
+// configured. Returns '' when nothing usable is found — the user can
+// still type a host manually.
+async function getPrefilledHostForAdd() {
+  let url = '';
+  try {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    url = tabs?.[0]?.url || '';
+  } catch (_) {
+    return '';
+  }
+  if (!url) return '';
+  let host = '';
+  try { host = new URL(url).hostname.toLowerCase(); } catch (_) { return ''; }
+  if (!host) return '';
+  // Only prefill on actual Halo surfaces (standard or saved custom).
+  if (!isHaloUrl(url)) return '';
+  // Don't prefill if this host already has an entry.
+  const meta = await loadDomainsMeta();
+  if (meta[host]) return '';
+  return host;
+}
+
+async function addDomain({ host, env, label }) {
+  const status = document.getElementById('customDomainStatus');
+  const addForm = document.getElementById('domainAddForm');
+  const addBtn = document.getElementById('domainAddBtn');
+  if (status) status.textContent = '';
+
+  let match;
+  try {
+    match = normalizeCustomDomainMatch(host);
+  } catch (e) {
+    if (status) status.textContent = e.message;
+    return;
+  }
+  if (!match) {
+    if (status) status.textContent = 'Enter a hostname or URL.';
+    return;
+  }
+  const hostname = matchToHost(match);
+
+  // Persist env metadata first — it doesn't need permission.
+  const meta = await loadDomainsMeta();
+  meta[hostname] = {
+    env: env || '',                        // empty = auto-detect at read time
+    label: (label || '').trim().slice(0, 24)
+  };
+  await saveDomainsMeta(meta);
+
+  // For standard Halo hosts, no Chrome permission is needed — manifest already
+  // grants it. For custom hosts, add to the permission list.
+  if (!isHaloStandardHost(hostname)) {
+    const matches = Array.isArray(customHaloMatches) ? customHaloMatches.slice() : [];
+    if (!matches.includes(match)) {
+      matches.push(match);
+      const previousMatches = customHaloMatches.slice();
       await saveCustomHaloDomains(matches);
-      input.value = matches.map(match => match.replace(/\/\*$/, '')).join('\n');
-      status.textContent = `Domain${matches.length === 1 ? '' : 's'} saved. Requesting access…`;
-
+      if (status) status.textContent = 'Saved. Requesting Chrome permission…';
       const granted = await requestHostPermissions(matches);
       if (!granted) {
-        // Explicit deny when the popup survived (e.g. settings open in a tab).
-        // Roll back so we don't leave a useless entry. If the popup died with
-        // a deny, this rollback won't run — but isHaloAllowedUrl + the
-        // existing "Re-grant access" banner handle that state too.
         await saveCustomHaloDomains(previousMatches);
-        input.value = previousMatches.map(m => m.replace(/\/\*$/, '')).join('\n');
-        status.textContent = 'Permission denied. Domain not saved — click Save to try again.';
+        // Keep the meta entry — re-trying Save will pick it back up.
+        if (status) status.textContent = 'Permission denied. Click "+ Add tenant" to retry.';
+        renderDomainList();
         return;
       }
-
-      status.textContent = `${matches.length} custom domain${matches.length === 1 ? '' : 's'} saved.`;
       await injectIntoActiveCustomDomain(matches);
-      await refreshActiveTabState();
-    } catch (error) {
-      status.textContent = error.message || 'Could not save domains.';
-    } finally {
-      saveBtn.disabled = false;
     }
+  }
+
+  if (status) status.textContent = `Saved ${hostname}.`;
+  if (addForm) addForm.hidden = true;
+  if (addBtn) addBtn.hidden = false;
+  renderDomainList();
+  refreshActiveTabState();
+}
+
+async function updateDomainMeta(hostname, patch) {
+  const meta = await loadDomainsMeta();
+  meta[hostname] = Object.assign({}, meta[hostname] || {}, patch);
+  await saveDomainsMeta(meta);
+  refreshActiveTabState();
+}
+
+async function removeDomain(hostname) {
+  const meta = await loadDomainsMeta();
+  delete meta[hostname];
+  await saveDomainsMeta(meta);
+
+  // Remove from the Chrome permission list if it was a custom host.
+  if (!isHaloStandardHost(hostname)) {
+    const matches = (customHaloMatches || []).filter(m => matchToHost(m) !== hostname);
+    await saveCustomHaloDomains(matches);
+    try {
+      await new Promise(resolve => {
+        chrome.permissions.remove({ origins: [
+          `https://${hostname}/*`, `http://${hostname}/*`
+        ] }, () => resolve());
+      });
+    } catch (_) {}
+  }
+  renderDomainList();
+  refreshActiveTabState();
+}
+
+async function renderDomainList() {
+  const wrap = document.getElementById('domainListWrap');
+  if (!wrap) return;
+  const [matches, meta] = await Promise.all([
+    loadCustomHaloDomains(),
+    loadDomainsMeta()
+  ]);
+
+  // Union of: hosts from the custom-domain match list + any meta-only entries
+  // (the user may also have labelled standard-apex tenants like acme.haloitsm.com).
+  const hostsFromMatches = (matches || []).map(matchToHost).filter(Boolean);
+  const hostsFromMeta = Object.keys(meta || {});
+  const seen = new Set();
+  const hosts = [];
+  [...hostsFromMatches, ...hostsFromMeta].forEach(h => {
+    if (h && !seen.has(h)) { seen.add(h); hosts.push(h); }
+  });
+  hosts.sort();
+
+  wrap.innerHTML = '';
+  if (!hosts.length) {
+    wrap.innerHTML = '<div class="domain-empty">No tenants added yet. Click <strong>+ Add tenant</strong> to label one.</div>';
+    return;
+  }
+
+  const detect = typeof huDetectEnvironment === 'function' ? huDetectEnvironment : () => 'unknown';
+  const specs = (typeof HU_ENVIRONMENT_SPECS !== 'undefined') ? HU_ENVIRONMENT_SPECS : {};
+
+  hosts.forEach(host => {
+    const entry = meta[host] || {};
+    const resolvedEnv = entry.env || detect(host);
+    const spec = specs[resolvedEnv] || specs.unknown || { label: 'CUSTOM', color: '#64748b', bg: '#e2e8f0', text: '#334155' };
+    const labelText = (entry.label || '').trim() || spec.label;
+
+    const card = document.createElement('div');
+    card.className = 'domain-card';
+    card.innerHTML = `
+      <div class="domain-card-head">
+        <span class="domain-card-pill" style="background:${spec.bg};color:${spec.text};border-color:${spec.color}">${escapeHtml(labelText)}</span>
+        <span class="domain-card-host">${escapeHtml(host)}</span>
+        <button class="domain-card-remove" type="button" title="Remove tenant" aria-label="Remove tenant">×</button>
+      </div>
+      <div class="domain-card-controls">
+        <label class="domain-field">
+          <span class="domain-field-label">Environment</span>
+          <select class="domain-env-select input-field">
+            <option value="">Auto-detect (${escapeHtml((specs[detect(host)] || specs.unknown || { label: 'CUSTOM' }).label)})</option>
+            <option value="prod">PROD</option>
+            <option value="staging">STAGING</option>
+            <option value="uat">UAT</option>
+            <option value="test">TEST</option>
+            <option value="sandbox">SANDBOX</option>
+            <option value="dev">DEV</option>
+            <option value="unknown">Custom / other</option>
+          </select>
+        </label>
+        <label class="domain-field">
+          <span class="domain-field-label">Custom label</span>
+          <input class="domain-label-input input-field" type="text" value="${escapeHtml(entry.label || '')}" placeholder="(use env name)" maxlength="24">
+        </label>
+      </div>
+    `;
+    const envSelect = card.querySelector('.domain-env-select');
+    const labelInput = card.querySelector('.domain-label-input');
+    const removeBtn  = card.querySelector('.domain-card-remove');
+
+    envSelect.value = entry.env || '';
+    envSelect.addEventListener('change', () => {
+      updateDomainMeta(host, { env: envSelect.value }).then(() => renderDomainList());
+    });
+    labelInput.addEventListener('change', () => {
+      updateDomainMeta(host, { label: labelInput.value.trim().slice(0, 24) }).then(() => renderDomainList());
+    });
+    removeBtn.addEventListener('click', () => {
+      if (confirm(`Remove ${host}?\nThis revokes any Chrome host permission and clears the environment label.`)) {
+        removeDomain(host);
+      }
+    });
+
+    wrap.appendChild(card);
   });
 }
 
@@ -2550,7 +4042,7 @@ async function loadPreferences() {
   return Object.assign({
     ticket360Enabled: true,
     auto360: true,
-    drawer360Push: false,
+    drawer360Push: true,
     hideHaloSidebar: false,
     doubleClickTechFields: true
   }, data[SETTINGS_KEY] || {});
@@ -2570,7 +4062,12 @@ function setupPreferences() {
 
   const subWrap = document.getElementById('ticket360SubPrefs');
   const applyTicket360Lock = () => {
-    if (subWrap) subWrap.hidden = !enabledEl.checked;
+    if (!subWrap) return;
+    const off = !enabledEl.checked;
+    subWrap.classList.toggle('pref-sublist-locked', off);
+    subWrap.querySelectorAll('input.pref-toggle').forEach(input => {
+      input.disabled = off;
+    });
   };
 
   loadPreferences().then(prefs => {
