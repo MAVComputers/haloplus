@@ -22,6 +22,16 @@ const LAST_SEEN_VERSION_KEY = 'huLastSeenVersion';
 // belong in CHANGELOG.md. Only the entries for the current manifest version
 // are surfaced.
 const RELEASE_HIGHLIGHTS = {
+  '1.3.1': {
+    title: 'What\'s new in HaloPlus 1.3.1',
+    items: [
+      ['Plays nicely with Halo\'s Multi-Tab mode', 'If you use Halo\'s "Multiple Halo tabs per browser tab" setting, palette navigation no longer closes your other tabs. HaloPlus now talks to Halo\'s React Router directly via a main-world bridge instead of doing a full page reload. Reported as issue #3.'],
+      ['Optional: open palette navigation in a new Halo tab', 'New toggle under Settings → Preferences → In-page tools. When on, every palette navigation opens in a new Halo tab instead of replacing the active one. Auto-detects whether Multi-Tab mode is actually enabled and falls back to replacing the current tab when it isn\'t.'],
+      ['Ticket 360 button now appears on every open ticket tab', 'In Multi-Tab mode the toolbar button used to inject into only the first open ticket. Fixed — every open ticket\'s toolbar gets it.'],
+      ['Right-click context menu on Halo pages', 'Four new entries: Open Ticket 360, View audit log for this ticket, Open JSON inspector, Toggle field API names overlay. The ticket-specific items hide when you\'re not on a ticket page.'],
+      ['Faster, fewer 429 rate limits', 'Same-origin clicks inside Ticket 360 (client / site / user / KB links) used to do a full page reload, which re-fires every API call Halo makes on boot. Heavy palette + 360 use was burning through the per-IP rate limit. Both fixed — those clicks now SPA-navigate, and Halo stops re-bootstrapping on every navigation.']
+    ]
+  },
   '1.3.0': {
     title: 'What\'s new in HaloPlus 1.3.0',
     items: [
@@ -4058,7 +4068,8 @@ function setupPreferences() {
   const pushEl         = document.getElementById('prefDrawer360Push');
   const sidebarEl      = document.getElementById('prefHideHaloSidebar');
   const dblClickEl     = document.getElementById('prefDoubleClickTechFields');
-  if (!enabledEl || !auto360El || !pushEl || !sidebarEl || !dblClickEl) return;
+  const newTabEl       = document.getElementById('prefPaletteNewTab');
+  if (!enabledEl || !auto360El || !pushEl || !sidebarEl || !dblClickEl || !newTabEl) return;
 
   const subWrap = document.getElementById('ticket360SubPrefs');
   const applyTicket360Lock = () => {
@@ -4076,6 +4087,7 @@ function setupPreferences() {
     pushEl.checked     = !!prefs.drawer360Push;
     sidebarEl.checked  = !!prefs.hideHaloSidebar;
     dblClickEl.checked = prefs.doubleClickTechFields !== false;
+    newTabEl.checked   = !!prefs.openInNewHaloTab;
     applyTicket360Lock();
   });
 
@@ -4085,6 +4097,7 @@ function setupPreferences() {
     drawer360Push:         pushEl.checked,
     hideHaloSidebar:       sidebarEl.checked,
     doubleClickTechFields: dblClickEl.checked,
+    openInNewHaloTab:      newTabEl.checked,
   });
 
   enabledEl.addEventListener('change', () => { applyTicket360Lock(); persist(); });
@@ -4092,6 +4105,7 @@ function setupPreferences() {
   pushEl.addEventListener('change', persist);
   sidebarEl.addEventListener('change', persist);
   dblClickEl.addEventListener('change', persist);
+  newTabEl.addEventListener('change', persist);
 }
 
 document.addEventListener('DOMContentLoaded', init);

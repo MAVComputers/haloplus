@@ -32,7 +32,7 @@
     ticket360TicketId: 0,
     timelineTicketId: 0,
     theme: 'light',
-    settings: { auto360: true, drawer360Push: true, hideHaloSidebar: false, ticket360Enabled: true, doubleClickTechFields: true },
+    settings: { auto360: true, drawer360Push: true, hideHaloSidebar: false, ticket360Enabled: true, doubleClickTechFields: true, openInNewHaloTab: false },
     palette: { placement: 'mid', fontScale: 1 },
     review: { firstActiveAt: 0, dismissed: false, snoozeUntil: 0 },
     configTree: {},
@@ -1018,10 +1018,60 @@
     }
   }
 
+  // Halo writes its Multi-Tab mode state into localStorage as `haloTabState`
+  // (shared across isolated + main worlds). Presence of a `tabs` array means
+  // Multi-Tab is active right now; absence means single-tab mode.
+  function isHaloMultiTabActive() {
+    try {
+      const raw = localStorage.getItem('haloTabState');
+      if (!raw) return false;
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed && parsed.tabs);
+    } catch (_) { return false; }
+  }
+
+  // SPA-navigate via the main-world bridge (content/main-world-bridge.js).
+  // React's `_reactRootContainer` expando and Redux's store are invisible
+  // from the isolated content-script world, so we signal across via
+  // CustomEvent. Two modes:
+  //   - openInNewHaloTab off OR multi-tab inactive: history.push() → replace
+  //   - openInNewHaloTab on AND multi-tab active:   dispatch ADD_NEW_TAB
+  // CustomEvent `detail` is structured-cloned across worlds, so we can't
+  // read back a "handled" flag. Trust the bridge for same-origin and let
+  // it own the fallback if React Router isn't reachable. Only cross-origin
+  // URLs do a hard navigation here.
   function navigateTo(value) {
     const href = safeNavUrl(value);
-    if (href) window.location.assign(href);
+    if (!href) return;
+    let url;
+    try { url = new URL(href); } catch (_) {
+      window.location.assign(href);
+      return;
+    }
+    if (url.origin !== window.location.origin) {
+      window.location.assign(href);
+      return;
+    }
+    const useNewTab = HU.settings.openInNewHaloTab && isHaloMultiTabActive();
+    const eventName = useNewTab ? 'haloplus:open-new-tab' : 'haloplus:navigate';
+    window.dispatchEvent(new CustomEvent(eventName, {
+      detail: { path: url.pathname + url.search + url.hash }
+    }));
   }
+
+  // Delegated click handler for HaloPlus-rendered <a class="hu-spa-link"> tags.
+  // A plain `<a href="/tickets?id=1">` would do a hard browser navigation
+  // (closing every Halo Multi-Tab tab) — route them through navigateTo()
+  // instead. Modifier-key clicks (ctrl/cmd/shift, middle-click) keep their
+  // native semantics so the browser can still open them in a new tab.
+  document.addEventListener('click', e => {
+    if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+    const a = e.target && e.target.closest && e.target.closest('a.hu-spa-link[href]');
+    if (!a) return;
+    e.preventDefault();
+    e.stopPropagation();
+    navigateTo(a.getAttribute('href'));
+  }, true);
 
   function navCommand(id, title, subtitle, path, keywords = [], kind = '') {
     return command(id, title, subtitle, () => navigateTo(path), keywords, kind);
@@ -5883,7 +5933,7 @@ ${orderBy}
           id: slug,
           title: name,
           subtitle: `Open ${name} ticket list`,
-          run: () => window.location.assign(new URL(typeListUrl, window.location.origin).href),
+          run: () => navigateTo(typeListUrl),
           keywords: [slug],
           type: 'command',
           kind: 'Ticket Types',
@@ -7921,7 +7971,7 @@ ${orderBy}
       card.innerHTML = `
         <div class="hu-section-title-row">
           <span class="hu-section-title" style="margin:0">📘 Suggested KB article</span>
-          <a href="/kb?id=${escapeHtml(String(kb.id))}" class="hu-360-kb-open">Open</a>
+          <a href="/kb?id=${escapeHtml(String(kb.id))}" class="hu-360-kb-open hu-spa-link">Open</a>
         </div>
         <div class="hu-360-kb-title">${escapeHtml(title)}</div>
         ${abstract ? `<div class="hu-360-kb-abstract">${escapeHtml(abstract.slice(0, 240))}${abstract.length > 240 ? '…' : ''}</div>` : ''}`;
@@ -8183,9 +8233,9 @@ ${orderBy}
     customer.setAttribute('tabindex', '0');
     customer.setAttribute('aria-label', 'Change customer');
     const subParts = [];
-    if (clientId)   subParts.push(`<a href="${escapeHtml(routeDetail('customer', clientId))}">${escapeHtml(clientName || 'Client')}</a>`);
+    if (clientId)   subParts.push(`<a href="${escapeHtml(routeDetail('customer', clientId))}" class="hu-spa-link">${escapeHtml(clientName || 'Client')}</a>`);
     else if (clientName) subParts.push(escapeHtml(clientName));
-    if (siteId)     subParts.push(`<a href="${escapeHtml(routeDetail('site', siteId))}">${escapeHtml(siteName || 'Site')}</a>`);
+    if (siteId)     subParts.push(`<a href="${escapeHtml(routeDetail('site', siteId))}" class="hu-spa-link">${escapeHtml(siteName || 'Site')}</a>`);
     else if (siteName)   subParts.push(escapeHtml(siteName));
     const subHtml = subParts.length ? subParts.join('<span class="hu-360-cust-sep">·</span>') : '';
 
@@ -8209,7 +8259,7 @@ ${orderBy}
       <div class="hu-360-person-main">
         <div class="hu-360-person-label">Customer</div>
         <div class="hu-360-person-name">${userId
-          ? `<a href="${escapeHtml(routeDetail('user', userId))}">${escapeHtml(userName || 'User')}</a>`
+          ? `<a href="${escapeHtml(routeDetail('user', userId))}" class="hu-spa-link">${escapeHtml(userName || 'User')}</a>`
           : escapeHtml(userName || 'Unknown')}${marker}</div>
         ${subHtml ? `<div class="hu-360-person-sub">${subHtml}</div>` : ''}
       </div>
@@ -9967,7 +10017,7 @@ ${orderBy}
     if (path) {
       item.classList.add('hu-stat-link');
       item.title = `Open ${label}`;
-      item.addEventListener('click', () => window.location.assign(new URL(path, window.location.origin).href));
+      item.addEventListener('click', () => navigateTo(path));
     }
     return item;
   }
@@ -10102,7 +10152,7 @@ ${orderBy}
     if (routeType && recordId) {
       wrapper.classList.add('hu-list-row-link');
       wrapper.title = `Open ${recordType}`;
-      wrapper.addEventListener('click', () => window.location.assign(new URL(routeDetail(routeType, recordId), window.location.origin).href));
+      wrapper.addEventListener('click', () => navigateTo(routeDetail(routeType, recordId)));
     }
     return wrapper;
   }
@@ -11914,25 +11964,32 @@ ${orderBy}
   function injectTicket360Button() {
     if (HU.settings.ticket360Enabled === false) return;
     if (!getCurrentTicketId()) return;
-    if (document.getElementById('hu-360-inject-btn')) return;
-    const container = document.querySelector('.buttons-container:has(button[title="Share"])');
-    if (!container) return;
-    const btn = document.createElement('button');
-    btn.id = 'hu-360-inject-btn';
-    btn.className = 'solidbutton fabtn notext hu-360-inject-btn';
-    btn.type = 'button';
-    btn.title = 'Toggle Ticket 360 dashboard';
-    btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="white" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="2" width="14" height="12" rx="1.5"/><line x1="10" y1="2" x2="10" y2="14"/><line x1="1" y1="6.5" x2="10" y2="6.5"/><line x1="1" y1="10.5" x2="10" y2="10.5"/></svg>`;
-    if (document.getElementById('hu-ticket360-drawer')) btn.classList.add('is-active');
-    btn.addEventListener('click', e => {
-      e.stopPropagation();
-      if (document.getElementById('hu-ticket360-drawer')) {
-        closeDrawer('hu-ticket360-drawer');
-      } else {
-        openTicket360Panel();
-      }
+    // Multi-Tab mode keeps every open ticket pane mounted in the DOM at the
+    // same time, so we need to inject into every matching toolbar — not just
+    // the first one. Only the visible (active) tab's button is reachable,
+    // and clicks always target the URL-bar ticket id which already tracks
+    // the visible tab.
+    const containers = document.querySelectorAll('.buttons-container:has(button[title="Share"])');
+    if (!containers.length) return;
+    const drawerOpen = !!document.getElementById('hu-ticket360-drawer');
+    containers.forEach(container => {
+      if (container.querySelector('.hu-360-inject-btn')) return;
+      const btn = document.createElement('button');
+      btn.className = 'solidbutton fabtn notext hu-360-inject-btn';
+      btn.type = 'button';
+      btn.title = 'Toggle Ticket 360 dashboard';
+      btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="white" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="2" width="14" height="12" rx="1.5"/><line x1="10" y1="2" x2="10" y2="14"/><line x1="1" y1="6.5" x2="10" y2="6.5"/><line x1="1" y1="10.5" x2="10" y2="10.5"/></svg>`;
+      if (drawerOpen) btn.classList.add('is-active');
+      btn.addEventListener('click', e => {
+        e.stopPropagation();
+        if (document.getElementById('hu-ticket360-drawer')) {
+          closeDrawer('hu-ticket360-drawer');
+        } else {
+          openTicket360Panel();
+        }
+      });
+      container.insertBefore(btn, container.firstChild);
     });
-    container.insertBefore(btn, container.firstChild);
   }
 
   function scheduleAutoTicket360(attempt = 0) {
@@ -12067,6 +12124,17 @@ ${orderBy}
       return true;
     }
 
+    if (message.type === 'HU_OPEN_AUDIT') {
+      const ticketId = getCurrentTicketId();
+      if (!ticketId) {
+        sendResponse({ ok: false, error: 'Open a ticket first.' });
+        return false;
+      }
+      openAuditLogDrawer(ticketId);
+      sendResponse({ ok: true });
+      return false;
+    }
+
     if (message.type === 'HU_OPEN_TIMELINE') {
       openActionTimelinePanel()
         .then(ok => sendResponse(ok ? { ok: true } : { ok: false, error: 'Open a ticket first.' }))
@@ -12192,7 +12260,7 @@ ${orderBy}
 
     if (message.type === 'HU_NAVIGATE') {
       const path = message.data?.path;
-      if (path) window.location.assign(new URL(path, window.location.origin).href);
+      if (path) navigateTo(path);
       sendResponse({ ok: true });
       return false;
     }

@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.3.1
+
+### Halo Multi-Tab mode compatibility
+- **Palette navigation no longer wipes your tab strip.** Fixes [#3](https://github.com/alexwennekes212/haloplus/issues/3). Every HaloPlus navigation used to do a hard `window.location.assign`, which reloads the whole React app and collapses Halo's Multi-Tab tab strip to a single tab. The palette and side-panel record clicks now route through a new main-world bridge that calls Halo's React Router `history.push()` directly — the SPA stays alive and other open tabs survive.
+- **Optional "Open palette navigation in a new Halo tab" preference.** New toggle under **Settings → Preferences → In-page tools**. When on AND Halo's Multi-Tab mode is enabled (detected via the `haloTabState` localStorage key), palette navigations dispatch Halo's own `ADD_NEW_TAB` Redux action instead of replacing the active tab. URL is normalised to Halo's singular detail format (`/ticket?id=N&showmenu=true`) so the new tab renders the detail view, not the list view. Falls back to history.push when Multi-Tab is off — no surprise behaviour.
+- **Ticket 360 button now injects into every open ticket tab.** The toolbar button used a `getElementById` + `querySelector` pair that returned only the first match, so in Multi-Tab mode only one open ticket got the button. Now uses `querySelectorAll` and a per-container duplicate-check, so every visible ticket-toolbar gets it.
+- **In-360 client / site / user / KB anchors no longer trigger a full reload.** The four `<a href>` tags inside Ticket 360 were plain HTML anchors that the browser interpreted as full navigations. Tagged them with `hu-spa-link` and added a delegated click interceptor that routes them through the same SPA-friendly path; modifier-key clicks (ctrl/middle/shift) keep native open-in-new-tab semantics.
+
+### Right-click context menu
+- **Four new entries on Halo pages:** Open Ticket 360, View audit log for this ticket, Open JSON inspector, Toggle field API names overlay. Each item only appears on Halo domains (`*.halopsa.com`, `*.haloitsm.com`, `*.haloservicedesk.com`).
+- **Ticket-only items hide on non-ticket pages.** The 360 and audit items disappear when the active tab isn't a ticket page; JSON inspector and field-name overlay stay visible everywhere on Halo. Service worker listens to `tabs.onUpdated` and `tabs.onActivated` and toggles `chrome.contextMenus.update({ visible })` for each.
+
+### Architecture
+- **`content/main-world-bridge.js`** — new content script registered with `world: "MAIN"` in the manifest. Runs in the page's main world so it can read React's `_reactRootContainer` expando and Halo's Redux store — both invisible from the isolated content-script world. Exposes two cross-world bridges via CustomEvent:
+  - `haloplus:navigate` → walks the React fiber tree to find React Router's `history`, calls `history.push()`. Falls back to a bare `history.pushState` + popstate dispatch if React Router isn't reachable.
+  - `haloplus:open-new-tab` → finds Halo's Redux store and dispatches `ADD_NEW_TAB` with `{ pathname, search }` after running the URL through a plural→singular normaliser. Falls back to history.push if the store isn't reachable.
+
+### Fixes
+- **Cross-world CustomEvent fallback bug.** Chrome structured-clones the `detail` object when a CustomEvent crosses worlds, so a `detail.handled = true` write from the bridge never propagated back to the dispatcher. The isolated-world `navigateTo()` was reading the original (unmutated) detail and ALWAYS falling through to `window.location.assign(href)` — every same-origin nav was secretly doing a hard reload after the bridge had already navigated. The dispatcher now trusts the bridge for same-origin URLs and only falls back to a hard nav for cross-origin URLs or URL-parse failures.
+- **Knock-on 429 rate limits.** With the hard-reload bug fixed, Halo no longer re-fires its full SPA bootstrap (`/api/Tickets`, `/api/Notifications`, lookups, etc.) on every palette navigation, so the per-IP rate limit isn't being hammered during normal use.
+
 ## 1.3.0
 
 ### Tenant environment labels

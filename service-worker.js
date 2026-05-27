@@ -12,11 +12,100 @@ let iconCache = null;
 chrome.runtime.onInstalled.addListener(() => {
   registerCustomDomainContentScript();
   refreshAllTabIcons();
+  setupContextMenus();
 });
 
 chrome.runtime.onStartup?.addListener(() => {
   registerCustomDomainContentScript();
   refreshAllTabIcons();
+  setupContextMenus();
+});
+
+// Right-click context menu entries for Halo pages. Lets users reach
+// Ticket 360, the audit log, and the JSON inspector without first opening
+// the command palette or the side panel.
+function setupContextMenus() {
+  if (!chrome.contextMenus) return;
+  chrome.contextMenus.removeAll(() => {
+    const HALO_PATTERNS = [
+      '*://*.halopsa.com/*',
+      '*://*.haloitsm.com/*',
+      '*://*.haloservicedesk.com/*'
+    ];
+    chrome.contextMenus.create({
+      id: 'haloplus-open-ticket360',
+      title: 'Open Ticket 360',
+      contexts: ['page', 'link'],
+      documentUrlPatterns: HALO_PATTERNS
+    });
+    chrome.contextMenus.create({
+      id: 'haloplus-open-audit',
+      title: 'View audit log for this ticket',
+      contexts: ['page', 'link'],
+      documentUrlPatterns: HALO_PATTERNS
+    });
+    chrome.contextMenus.create({
+      id: 'haloplus-open-json',
+      title: 'Open JSON inspector',
+      contexts: ['page', 'link'],
+      documentUrlPatterns: HALO_PATTERNS
+    });
+    chrome.contextMenus.create({
+      id: 'haloplus-toggle-fields',
+      title: 'Toggle field API names overlay',
+      contexts: ['page', 'link'],
+      documentUrlPatterns: HALO_PATTERNS
+    });
+    // Hide ticket-specific items until we know the active tab is a ticket page.
+    chrome.contextMenus.update('haloplus-open-ticket360', { visible: false }, () => void chrome.runtime.lastError);
+    chrome.contextMenus.update('haloplus-open-audit',     { visible: false }, () => void chrome.runtime.lastError);
+    chrome.tabs.query({ active: true, lastFocusedWindow: true }, ([tab]) => {
+      if (tab) updateContextMenusForTab(tab);
+    });
+  });
+}
+
+chrome.contextMenus?.onClicked.addListener((info, tab) => {
+  if (!tab?.id) return;
+  const action = {
+    'haloplus-open-ticket360':  'HU_OPEN_TICKET360',
+    'haloplus-open-audit':      'HU_OPEN_AUDIT',
+    'haloplus-open-json':       'HU_OPEN_JSON',
+    'haloplus-toggle-fields':   'HU_TOGGLE_FIELDS'
+  }[info.menuItemId];
+  if (!action) return;
+  chrome.tabs.sendMessage(tab.id, { type: action }, () => void chrome.runtime.lastError);
+});
+
+// Show/hide ticket-specific menu items based on the active tab's URL.
+// Ticket pages are `/tickets?id=N` (list+detail), `/ticket?id=N` (multi-tab
+// detail), or `/faults?id=N` (legacy). Items stay visible on any Halo URL
+// (via documentUrlPatterns) but ticket-specific ones disappear when off a
+// ticket page.
+const TICKET_PATH_RE = /^\/(tickets?|faults?)(\/|$)/i;
+const TICKET_ID_KEYS = ['id', 'faultid'];
+
+function isTicketUrl(url) {
+  if (!url) return false;
+  try {
+    const u = new URL(url);
+    if (!TICKET_PATH_RE.test(u.pathname)) return false;
+    return TICKET_ID_KEYS.some(k => /^\d+$/.test(u.searchParams.get(k) || ''));
+  } catch (_) { return false; }
+}
+
+function updateContextMenusForTab(tab) {
+  if (!chrome.contextMenus) return;
+  const onTicket = isTicketUrl(tab?.url);
+  chrome.contextMenus.update('haloplus-open-ticket360', { visible: onTicket }, () => void chrome.runtime.lastError);
+  chrome.contextMenus.update('haloplus-open-audit',     { visible: onTicket }, () => void chrome.runtime.lastError);
+}
+
+chrome.tabs?.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.url || changeInfo.status === 'complete') updateContextMenusForTab(tab);
+});
+chrome.tabs?.onActivated.addListener(({ tabId }) => {
+  chrome.tabs.get(tabId, tab => { if (!chrome.runtime.lastError) updateContextMenusForTab(tab); });
 });
 
 // When the user grants a host permission via chrome.permissions.request, fire
