@@ -15,6 +15,7 @@ const SETTINGS_KEY = 'huSettings';
 const CUSTOM_DOMAINS_KEY = 'huCustomHaloDomains';
 // HALO_HOST_PATTERN is provided by shared/constants.js (loaded before this script).
 const RELEASES_URL = 'https://www.gethaloplus.com/releases.html';
+const MANUAL_URL = 'https://www.gethaloplus.com/manual.html';
 const LAST_SEEN_VERSION_KEY = 'huLastSeenVersion';
 
 // Per-version highlights shown in the "What's new" banner after an update.
@@ -22,6 +23,14 @@ const LAST_SEEN_VERSION_KEY = 'huLastSeenVersion';
 // belong in CHANGELOG.md. Only the entries for the current manifest version
 // are surfaced.
 const RELEASE_HIGHLIGHTS = {
+  '1.3.2': {
+    title: 'What\'s new in HaloPlus 1.3.2',
+    items: [
+      ['Critical fix for v1.3.0 update', 'If you updated from v1.2.1 to v1.3.0 today, the side panel rendered but no buttons or tabs reacted to clicks. The cause: the v1.3.0 zip we published to the Chrome Web Store accidentally omitted a bundled folder. This release packs everything correctly AND hardens the panel\'s startup so a single missing file can never break it like that again.'],
+      ['Includes everything from v1.3.1', 'Multi-Tab compatibility (palette no longer closes your other Halo tabs), optional "open palette navigation in a new Halo tab" preference, the right-click context menu (Open Ticket 360 / View audit log / Open JSON inspector / Toggle field overlay), and the Ticket 360 button injecting into every open ticket. v1.3.1 was tagged but never reached the Chrome Web Store.'],
+      ['"Read the full manual" button', 'New button in Settings → Help & About → Getting started, opens the full chapter-by-chapter manual at gethaloplus.com/manual in a new tab.']
+    ]
+  },
   '1.3.1': {
     title: 'What\'s new in HaloPlus 1.3.1',
     items: [
@@ -210,18 +219,22 @@ const LOOKUP_LABEL_COLUMNS = {
 async function init() {
   await initTheme();
   syncManifestVersion();
-  TABLES = await loadJSON('../schema/tables.json');
-  await loadCustomSchema();
-  await loadCachedFieldInfoCFs();
-  await loadCachedApiFieldKeys();
-  await loadCachedViewColumnLabels();
-  await loadCustomHaloDomains();
-  const joinsData = await loadJSON('../schema/joins.json');
-  JOINS = joinsData.joins;
-  const varsData = await loadJSON('../schema/variables.json');
-  VARIABLES = varsData.variables;
-  const tplData = await loadJSON('../templates/templates.json');
-  TEMPLATES = tplData.categories;
+  // Each async load is wrapped so a single missing/broken bundle resource
+  // (e.g. an icon-or-script-only zip that forgot a JSON folder) can't crash
+  // init() before the setupXxx() event-wiring runs. Symptom of the original
+  // bug: panel rendered but nothing reacted to clicks.
+  TABLES = await safeLoadJSON('../schema/tables.json', {});
+  await loadCustomSchema().catch(err => console.error('[HaloPlus] loadCustomSchema failed', err));
+  await loadCachedFieldInfoCFs().catch(err => console.error('[HaloPlus] loadCachedFieldInfoCFs failed', err));
+  await loadCachedApiFieldKeys().catch(err => console.error('[HaloPlus] loadCachedApiFieldKeys failed', err));
+  await loadCachedViewColumnLabels().catch(err => console.error('[HaloPlus] loadCachedViewColumnLabels failed', err));
+  await loadCustomHaloDomains().catch(err => console.error('[HaloPlus] loadCustomHaloDomains failed', err));
+  const joinsData = await safeLoadJSON('../schema/joins.json', { joins: {} });
+  JOINS = joinsData.joins || {};
+  const varsData = await safeLoadJSON('../schema/variables.json', { variables: {} });
+  VARIABLES = varsData.variables || {};
+  const tplData = await safeLoadJSON('../templates/templates.json', { categories: [] });
+  TEMPLATES = tplData.categories || [];
 
   setupTabs();
   renderSchemaExplorer();
@@ -231,6 +244,7 @@ async function init() {
   setupUtilityEvents();
   setupRegrantButton();
   setupDiagnostics();
+  setupManualButton();
   listenForContext();
   await refreshActiveTabState();
   showReleaseHighlightsIfNew();
@@ -347,6 +361,20 @@ function autoRefreshSchema() {
 async function loadJSON(path) {
   const resp = await fetch(path);
   return resp.json();
+}
+
+// Same as loadJSON but returns a fallback on any failure (404, parse error,
+// permission denied) instead of throwing. Use this in init() so a missing
+// bundled resource can't crash the whole panel boot sequence.
+async function safeLoadJSON(path, fallback) {
+  try {
+    const resp = await fetch(path);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    return await resp.json();
+  } catch (err) {
+    console.warn('[HaloPlus] safeLoadJSON failed for', path, '— using fallback. Error:', err.message);
+    return fallback;
+  }
 }
 
 async function initTheme() {
@@ -3037,6 +3065,15 @@ function setupDiagnostics() {
   if (runBtn) runBtn.addEventListener('click', runDiagnostics);
   if (copyBtn) copyBtn.addEventListener('click', copyDiagnostics);
   if (probeBtn) probeBtn.addEventListener('click', runExtendedProbes);
+}
+
+function setupManualButton() {
+  const btn = document.getElementById('openManualBtn');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    if (chrome?.tabs?.create) chrome.tabs.create({ url: MANUAL_URL });
+    else window.open(MANUAL_URL, '_blank', 'noopener');
+  });
 }
 
 function runDiagnostics() {

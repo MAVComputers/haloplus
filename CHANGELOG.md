@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.3.2
+
+### Critical fix
+- **Side panel was broken on the v1.3.0 Chrome Web Store build.** The released zip did not include the `templates/` folder, so `panel.js` 404'd on `templates/templates.json` during `init()`. The error threw before any `setupXxx()` event-wiring ran, so the panel rendered with the right HTML but no click handlers attached — every tab, button, and toggle appeared dead. v1.3.0 and v1.3.1 zips both had this defect; this release bundles `templates/` correctly.
+- **`init()` is now resilient to missing bundle resources.** New `safeLoadJSON(path, fallback)` helper in [panel.js](sidepanel/panel.js) wraps every static JSON load with try/catch — a single missing/broken file can no longer abort the setup chain. Same for the chrome.storage loaders. Defends against any future packing-list mistake.
+
+### Quality-of-life
+- **"Read the full manual" button** added to **Settings → Help & About → Getting started**. Opens [gethaloplus.com/manual.html](https://www.gethaloplus.com/manual.html) in a new browser tab. Previously the manual was only reachable from the website footer / release notes.
+
+### Notes
+- v1.3.1 (Multi-Tab compatibility + right-click context menu) was tagged on GitHub but never shipped to the Chrome Web Store; users updating from v1.2.1 or v1.3.0 see the v1.3.1 changes for the first time as part of this release.
+
 ## 1.3.1
 
 ### Halo Multi-Tab mode compatibility
