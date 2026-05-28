@@ -1985,6 +1985,79 @@ FROM (
       }
       .hu-table-column-label-target { display: inline-flex; align-items: center; max-width: 100%; min-width: 0; }
       .hu-json-formatted { font-family: "SF Mono", "Cascadia Code", Consolas, monospace; font-size: 11px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; color: #172033; padding: 10px; margin: 0; }
+      #hu-json-drawer .hu-drawer-body { padding: 0; }
+      .hu-json-toolbar {
+        position: sticky; top: 0; z-index: 10;
+        display: flex; flex-direction: column;
+        gap: 8px;
+        padding: 10px;
+        background: #fff;
+        border-bottom: 1px solid #e3e7ef;
+      }
+      .hu-json-toolbar-meta { display: flex; flex-direction: column; min-width: 0; }
+      .hu-json-toolbar-meta .hu-row-title,
+      .hu-json-toolbar-meta .hu-row-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .hu-json-toolbar-controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+      .hu-json-count { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; color: #667085; min-height: 14px; }
+      .hu-json-search {
+        flex: 1 1 180px; min-width: 140px;
+        padding: 5px 9px; font-size: 12px;
+        border: 1px solid #d8dde8; border-radius: 6px;
+        background: #fff; color: #172033;
+        outline: none;
+      }
+      .hu-json-search:focus { border-color: #ff9b51; box-shadow: 0 0 0 3px rgba(255,155,81,0.18); }
+      .hu-json-view-toggle { display: inline-flex; border: 1px solid #d8dde8; border-radius: 6px; overflow: hidden; }
+      .hu-json-view-btn {
+        background: #fff; border: 0; padding: 4px 10px; cursor: pointer;
+        font-size: 11px; font-weight: 600; color: #5e7290;
+      }
+      .hu-json-view-btn + .hu-json-view-btn { border-left: 1px solid #d8dde8; }
+      .hu-json-view-btn:hover { color: #25343f; }
+      .hu-json-view-btn.is-active { background: #25343f; color: #fff; }
+      .hu-json-action {
+        background: #fff; border: 1px solid #d8dde8; border-radius: 6px;
+        padding: 4px 9px; cursor: pointer; font-size: 11px; color: #25343f;
+      }
+      .hu-json-action:hover { border-color: #b5bdcc; }
+      .hu-json-tree {
+        padding: 8px 10px 14px;
+        font-family: "SF Mono", "Cascadia Code", Consolas, monospace;
+        font-size: 11.5px; line-height: 1.55;
+      }
+      .hu-json-node { position: relative; }
+      .hu-json-node-header,
+      .hu-json-leaf {
+        display: flex; align-items: center; gap: 4px;
+        padding: 1px 4px; border-radius: 3px;
+        min-width: 0;
+      }
+      .hu-json-node-header { cursor: pointer; user-select: none; }
+      .hu-json-node-header:hover { background: rgba(37, 52, 63, 0.05); }
+      .hu-json-leaf:hover { background: rgba(37, 52, 63, 0.04); }
+      .hu-json-arrow {
+        display: inline-block; width: 10px; color: #8694a0;
+        font-size: 9px; transition: transform 0.1s ease;
+        flex-shrink: 0;
+      }
+      .hu-json-node.is-collapsible.is-open > .hu-json-node-header .hu-json-arrow { transform: rotate(90deg); }
+      .hu-json-children { display: none; margin-left: 14px; border-left: 1px dashed #e3e7ef; padding-left: 10px; }
+      .hu-json-node.is-collapsible.is-open > .hu-json-children { display: block; }
+      .hu-json-key { color: #2259bc; font-weight: 600; }
+      .hu-json-sep { color: #8694a0; }
+      .hu-json-summary { color: #8694a0; font-size: 10.5px; margin-left: 2px; }
+      .hu-json-value { white-space: pre-wrap; word-break: break-word; min-width: 0; }
+      .hu-json-string { color: #1f7a3a; }
+      .hu-json-number { color: #b8651f; }
+      .hu-json-boolean { color: #8a3ab9; font-weight: 600; }
+      .hu-json-null { color: #94a3b8; font-style: italic; }
+      .hu-json-copy-btn { margin-left: auto; flex-shrink: 0; opacity: 0; transition: opacity 0.1s ease; }
+      .hu-json-node-header:hover .hu-json-copy-btn,
+      .hu-json-leaf:hover .hu-json-copy-btn { opacity: 1; }
+      .hu-json-node.is-match > .hu-json-node-header,
+      .hu-json-node.is-match > .hu-json-leaf { background: rgba(255, 220, 100, 0.35); }
+      .hu-json-mark { background: rgba(255, 220, 100, 0.6); color: inherit; border-radius: 2px; padding: 0 1px; }
+      .hu-json-empty { padding: 16px; text-align: center; color: #667085; font-size: 12px; }
       .hu-copy { border: 1px solid #d8dde8; background: #fff; border-radius: 5px; cursor: pointer; font-size: 10px; padding: 2px 6px; color: #172033; }
       .hu-copy-json { font-size: 11px; padding: 4px 10px; white-space: nowrap; flex-shrink: 0; }
       .hu-toolbar-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; padding: 10px; border-bottom: 1px solid #edf0f5; }
@@ -2228,9 +2301,12 @@ FROM (
       .hu-360-tl-title { font-size: 12px; font-weight: 700; color: #172033; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .hu-360-tl-meta { font-size: 11px; color: #667085; margin-top: 2px; }
       .hu-360-tl-note { font-size: 11px; color: #5e7290; background: #f8fafc; border: 1px solid #edf0f5; border-radius: 5px; padding: 6px 8px; margin-top: 6px; line-height: 1.4; white-space: pre-wrap; overflow-wrap: break-word; }
-      button#hu-360-inject-btn { background: #fe9200 !important; border-color: #fe9200 !important; color: #fff !important; transition: background 0.15s, border-color 0.15s !important; }
-      button#hu-360-inject-btn:hover { background: #e68400 !important; border-color: #e68400 !important; }
-      button#hu-360-inject-btn.is-active { background: #bf6e00 !important; border-color: #bf6e00 !important; box-shadow: 0 0 0 3px rgba(254,146,0,0.25) !important; }
+      /* Default state inherits Halo's white button styling. Icon colour follows
+         currentColor so it stays visible. Active state highlights in HaloPlus
+         orange. Triple-class specificity (0,3,1) beats Halo's button.solidbutton.notext (0,2,1). */
+      button.hu-360-inject-btn.hu-360-inject-btn.hu-360-inject-btn { color: #25343f !important; transition: background 0.15s, border-color 0.15s, color 0.15s !important; }
+      button.hu-360-inject-btn.hu-360-inject-btn.hu-360-inject-btn:hover { background: #fe9200 !important; border-color: #fe9200 !important; color: #fff !important; }
+      button.hu-360-inject-btn.hu-360-inject-btn.hu-360-inject-btn.is-active { background: #bf6e00 !important; border-color: #bf6e00 !important; color: #fff !important; box-shadow: 0 0 0 3px rgba(254,146,0,0.25) !important; }
 
       /* Ticket 360 v2 — banners (VIP, approval, major incident) */
       .hu-360-banners { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
@@ -2334,6 +2410,15 @@ FROM (
       html.hu-theme-dark .hu-audit-chip.is-active .hu-audit-chip-count {
         background: rgba(0,0,0,0.18);
       }
+      .hu-audit-chip.is-empty {
+        opacity: 0.35;
+        background: transparent;
+        color: #94a3b8;
+        border-style: dashed;
+      }
+      .hu-audit-chip.is-empty:hover { color: #94a3b8; border-color: #d8dde8; }
+      html.hu-theme-dark .hu-audit-chip.is-empty { color: #525d72; }
+      html.hu-theme-dark .hu-audit-chip.is-empty:hover { color: #525d72; border-color: #303744; }
       .hu-audit-change { padding: 2px 0; }
       .hu-audit-change + .hu-audit-change { border-top: 1px dashed rgba(0,0,0,0.04); margin-top: 2px; padding-top: 4px; }
       html.hu-theme-dark .hu-audit-change + .hu-audit-change { border-top-color: rgba(255,255,255,0.05); }
@@ -2614,6 +2699,22 @@ FROM (
         .hu-drawer-header { border-color: #303744; }
         .hu-toolbar-row { border-color: #303744; }
         .hu-json-formatted { color: #edf1f7; }
+        .hu-json-toolbar { background: #151d2c; border-bottom-color: #303744; }
+        .hu-json-search { background: #0f1626; border-color: #303744; color: #edf1f7; }
+        .hu-json-view-toggle { border-color: #303744; }
+        .hu-json-view-btn { background: #1a2236; color: #a7afbd; }
+        .hu-json-view-btn + .hu-json-view-btn { border-left-color: #303744; }
+        .hu-json-view-btn.is-active { background: #ff9b51; color: #25343f; }
+        .hu-json-action { background: #1a2236; border-color: #303744; color: #edf1f7; }
+        .hu-json-key { color: #6fa8ff; }
+        .hu-json-string { color: #5dd699; }
+        .hu-json-number { color: #ffb874; }
+        .hu-json-boolean { color: #c89aff; }
+        .hu-json-children { border-left-color: #303744; }
+        .hu-json-node-header:hover,
+        .hu-json-leaf:hover { background: rgba(255, 255, 255, 0.05); }
+        .hu-json-mark { background: rgba(255, 200, 80, 0.35); color: #ffd87a; }
+        .hu-json-count { color: #94a3b8; }
         .hu-section-row { background: #1a2236; border-color: #303744; }
         .hu-section-label { color: #a7afbd; }
         .hu-api-row:hover { background: #1d2533; }
@@ -3396,6 +3497,33 @@ FROM (
       .hu-360-note-save { background: #538dba; color: #fff; border-color: #538dba; }
       .hu-360-note-save:hover { background: #6ea0c8; }
       .hu-360-note-status { font-size: 10.5px; color: rgba(255,255,255,0.55); margin-top: 6px; }
+      .hu-360-mention-pop {
+        position: fixed; z-index: 2147483646;
+        min-width: 220px; max-width: 320px;
+        background: #1a2236; border: 1px solid #303744;
+        border-radius: 6px;
+        box-shadow: 0 12px 36px rgba(0,0,0,0.5);
+        overflow: hidden;
+      }
+      .hu-360-mention-list { max-height: 220px; overflow-y: auto; }
+      .hu-360-mention-row {
+        display: flex; align-items: center; gap: 8px;
+        width: 100%; text-align: left;
+        padding: 6px 10px; background: transparent;
+        border: 0; cursor: pointer; color: #edf1f7;
+        font-size: 12px; font-family: inherit;
+      }
+      .hu-360-mention-row:hover,
+      .hu-360-mention-row.is-active { background: #2a3a55; }
+      .hu-360-mention-name { font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+      .hu-360-mention-team { font-size: 10.5px; color: #94a3b8; flex-shrink: 0; }
+      .hu-360-mention-empty { padding: 8px 10px; font-size: 11.5px; color: #94a3b8; }
+      html.hu-theme-light .hu-360-mention-pop { background: #fff; border-color: #d8dde8; box-shadow: 0 12px 36px rgba(8,16,30,0.18); }
+      html.hu-theme-light .hu-360-mention-row { color: #172033; }
+      html.hu-theme-light .hu-360-mention-row:hover,
+      html.hu-theme-light .hu-360-mention-row.is-active { background: #eef4ff; }
+      html.hu-theme-light .hu-360-mention-team { color: #5e7290; }
+      html.hu-theme-light .hu-360-mention-empty { color: #5e7290; }
       .hu-360-time-row { display: flex; gap: 10px; }
       .hu-360-time-label {
         display: flex; flex-direction: column; gap: 4px;
@@ -3613,6 +3741,15 @@ FROM (
       html.hu-theme-light .hu-drawer-header,
       html.hu-theme-light .hu-toolbar-row { border-color: #edf0f5; }
       html.hu-theme-light .hu-json-formatted { color: #172033; }
+      html.hu-theme-light .hu-json-toolbar { background: #fff; border-bottom-color: #e3e7ef; }
+      html.hu-theme-light .hu-json-search { background: #fff; border-color: #d8dde8; color: #172033; }
+      html.hu-theme-light .hu-json-view-toggle { border-color: #d8dde8; }
+      html.hu-theme-light .hu-json-view-btn { background: #fff; color: #5e7290; }
+      html.hu-theme-light .hu-json-view-btn.is-active { background: #25343f; color: #fff; }
+      html.hu-theme-light .hu-json-action { background: #fff; border-color: #d8dde8; color: #25343f; }
+      html.hu-theme-light .hu-json-key { color: #2259bc; }
+      html.hu-theme-light .hu-json-string { color: #1f7a3a; }
+      html.hu-theme-light .hu-json-children { border-left-color: #e3e7ef; }
       html.hu-theme-light .hu-section-row { background: #f3f6fc; border-color: #e3e7ef; }
       html.hu-theme-light .hu-section-label { color: #667085; }
       html.hu-theme-light .hu-api-row:hover { background: #f8fafc; }
@@ -3672,6 +3809,27 @@ FROM (
       html.hu-theme-dark .hu-drawer-header,
       html.hu-theme-dark .hu-toolbar-row { border-color: #303744; }
       html.hu-theme-dark .hu-json-formatted { color: #edf1f7; }
+      html.hu-theme-dark .hu-json-toolbar { background: #151d2c; border-bottom-color: #303744; }
+      html.hu-theme-dark .hu-json-search { background: #0f1626; border-color: #303744; color: #edf1f7; }
+      html.hu-theme-dark .hu-json-search:focus { border-color: #ff9b51; }
+      html.hu-theme-dark .hu-json-view-toggle { border-color: #303744; }
+      html.hu-theme-dark .hu-json-view-btn { background: #1a2236; color: #a7afbd; }
+      html.hu-theme-dark .hu-json-view-btn + .hu-json-view-btn { border-left-color: #303744; }
+      html.hu-theme-dark .hu-json-view-btn:hover { color: #edf1f7; }
+      html.hu-theme-dark .hu-json-view-btn.is-active { background: #ff9b51; color: #25343f; }
+      html.hu-theme-dark .hu-json-action { background: #1a2236; border-color: #303744; color: #edf1f7; }
+      html.hu-theme-dark .hu-json-action:hover { border-color: #45526a; }
+      html.hu-theme-dark .hu-json-key { color: #6fa8ff; }
+      html.hu-theme-dark .hu-json-string { color: #5dd699; }
+      html.hu-theme-dark .hu-json-number { color: #ffb874; }
+      html.hu-theme-dark .hu-json-boolean { color: #c89aff; }
+      html.hu-theme-dark .hu-json-children { border-left-color: #303744; }
+      html.hu-theme-dark .hu-json-node-header:hover,
+      html.hu-theme-dark .hu-json-leaf:hover { background: rgba(255, 255, 255, 0.05); }
+      html.hu-theme-dark .hu-json-mark { background: rgba(255, 200, 80, 0.35); color: #ffd87a; }
+      html.hu-theme-dark .hu-json-node.is-match > .hu-json-node-header,
+      html.hu-theme-dark .hu-json-node.is-match > .hu-json-leaf { background: rgba(255, 200, 80, 0.2); }
+      html.hu-theme-dark .hu-json-count { color: #94a3b8; }
       html.hu-theme-dark .hu-section-row { background: #1a2236; border-color: #303744; }
       html.hu-theme-dark .hu-section-label { color: #a7afbd; }
       html.hu-theme-dark .hu-api-row:hover { background: #1d2533; }
@@ -6309,8 +6467,62 @@ ${orderBy}
     return String(raw);
   }
 
-  // Audit log — on-demand fetch (with include_auditing=true), separate
-  // from the cached loadTicketRecord call because the payload can be huge.
+  // Map a row from the SQL AUDIT table into the same shape the rest of the
+  // audit renderer expects (originally written against the /api/tickets
+  // audit_log array). Field correspondence verified against a live tenant.
+  function normaliseSqlAuditRow(r) {
+    return {
+      id: Number(r.AID || 0),
+      ticket_id: Number(r.AFaultid || 0),
+      agent_id: Number(r.AUnum || 0),
+      date: r.ADate,
+      value: r.AValue || '',
+      to: r.ATo || '',
+      from: r.AFrom || '',
+      table_name: r.atablename || '',
+      actoutcome: r.aactoutcome || '',
+      user_id: Number(r.auserid || 0),
+      isintegrator: r.aisintegrator === true || r.aisintegrator === 'true' || r.aisintegrator === 'True' || r.aisintegrator === '1',
+      // username is empty; the renderer falls back to cache_agent lookup by agent_id.
+      username: '',
+      __source: 'audit'
+    };
+  }
+
+  // Map an Actions row (notes, emails, time logs, status changes via outcomes)
+  // into the same shape, so the audit drawer can show a unified activity log.
+  // Halo's AUDIT table only captures field-level changes — Actions captures
+  // the conversational layer (notes, emails) which other agents most often
+  // make. Both belong in the audit timeline.
+  function normaliseActionRow(r) {
+    const noteSnippet = (r.note || r.emailbody || '').toString().slice(0, 300);
+    return {
+      id: Number(r.actionnumber || 0),
+      ticket_id: Number(r.Faultid || 0),
+      agent_id: Number(r.ActionUserdef || 0),
+      date: r.Whe_,
+      // Put the outcome (e.g. "Note Added", "Public Note", "Re-Assign") as the
+      // field-label / value, and the note body as the "to" side so it renders.
+      value: r.Actoutcome || 'Action',
+      to: noteSnippet,
+      from: '',
+      table_name: 'actions',
+      actoutcome: r.Actoutcome || '',
+      user_id: 0,
+      isintegrator: false,
+      // The "who" column already carries a friendly display name, which the
+      // renderer prefers over agent_id when present.
+      username: r.who || '',
+      __source: 'action'
+    };
+  }
+
+  // Audit log — on-demand fetch. Two paths:
+  //   1. Admin path (HU.reportApiOk): query the AUDIT SQL table via /api/Report.
+  //      Returns the FULL multi-agent history. The /api/tickets endpoint filters
+  //      audit rows to current-user + system only; SQL bypasses that filter.
+  //   2. API path (fallback): /api/tickets/{id}?include_auditing=true. Current-user
+  //      and system rows only, with a UI note explaining the limitation.
   async function openAuditLogDrawer(ticketId) {
     injectStyles();
     closeDrawer('hu-audit-drawer');
@@ -6320,30 +6532,73 @@ ${orderBy}
     body.innerHTML = '<div class="hu-row"><span class="hu-row-title">Loading audit log…</span></div>';
     openDrawer(drawer);
 
-    let ticket;
-    try {
-      ticket = await haloApiRequest(
-        `/api/tickets/${ticketId}?include_auditing=true&nocache=true`
-      );
-    } catch (e) {
-      body.innerHTML = `<div class="hu-row"><span class="hu-row-title">Couldn't load audit log</span><span class="hu-row-sub">${escapeHtml(String(e?.message || e))}</span></div>`;
-      return;
+    let rows = [];
+    let usedSqlPath = false;
+
+    // Try the SQL path unless we already know /api/Report is blocked.
+    // The probe runs at boot+500ms, so a freshly-loaded page may still have
+    // reportApiOk === null; in that case we try anyway and let the try/catch
+    // sort it out, rather than falling through to the filtered API.
+    //
+    // The activity log merges two sources:
+    //   AUDIT   — field-level changes (status, priority, assignee, CFs, etc.)
+    //   Actions — conversational layer (notes, emails, time logs, re-assigns)
+    // Halo's per-user filter applies to /api/tickets but NOT to /api/Report,
+    // so the SQL path gives the full multi-agent activity history.
+    if (HU.reportApiOk !== false) {
+      try {
+        const tid = Number(ticketId);
+        // TOP N is required: Halo wraps user SQL in a subquery, and SQL Server
+        // disallows ORDER BY in subqueries unless paired with TOP/OFFSET/FOR XML.
+        // 500 is generous for any single ticket's history without risk of cut-off.
+        const auditSql = `SELECT TOP 500 AID, AFaultid, AUnum, ADate, AValue, ATo, AFrom, atablename, aactoutcome, auserid, aisintegrator FROM AUDIT WHERE AFaultid = ${tid} ORDER BY ADate DESC`;
+        const actionSql = `SELECT TOP 500 actionnumber, Faultid, Whe_, Actoutcome, who, note, emailbody, ActionUserdef FROM Actions WHERE Faultid = ${tid} AND ISNULL(ActionHide, 0) = 0 ORDER BY Whe_ DESC`;
+        const [auditData, actionData] = await Promise.all([
+          runHaloReport(auditSql, 'HaloPlus Audit Log').catch(() => null),
+          runHaloReport(actionSql, 'HaloPlus Actions Log').catch(() => null)
+        ]);
+        const auditRows = (auditData?.report?.rows || []).map(normaliseSqlAuditRow);
+        const actionRows = (actionData?.report?.rows || []).map(normaliseActionRow);
+        if (auditRows.length || actionRows.length) {
+          rows = [...auditRows, ...actionRows].sort((a, b) => {
+            const da = a.date ? Date.parse(String(a.date).endsWith('Z') ? a.date : a.date + 'Z') : 0;
+            const db = b.date ? Date.parse(String(b.date).endsWith('Z') ? b.date : b.date + 'Z') : 0;
+            return db - da;
+          });
+          usedSqlPath = true;
+        }
+      } catch (e) {
+        // SQL path failed entirely — could be permission, network, or syntax. Fall through to API.
+      }
     }
 
-    // Halo returns four parallel audit arrays on the ticket payload:
-    //   audit_log    — general entries (status changes, field edits, etc.)
-    //   auditstatus  — status-only changes
-    //   auditunum    — agent / assignee changes
-    //   auditdate    — date-field changes
-    // All four share the same row schema: { id, date, agent_id, username,
-    // value, from, to, table_name, ... }. Merging them gives the full trail.
-    const candidateKeys = ['audit_log', 'auditstatus', 'auditunum', 'auditdate',
-                           'auditing', 'audit', 'audits', 'audit_trail', 'audit_history'];
-    const rows = [];
-    candidateKeys.forEach(k => {
-      const v = ticket && ticket[k];
-      if (Array.isArray(v)) v.forEach(r => rows.push(r));
-    });
+    // API path — used for non-admins and as a fallback if the SQL path returns no rows.
+    if (!rows.length) {
+      let ticket;
+      try {
+        ticket = await haloApiRequest(
+          `/api/tickets/${ticketId}?include_auditing=true&nocache=true`
+        );
+      } catch (e) {
+        body.innerHTML = `<div class="hu-row"><span class="hu-row-title">Couldn't load audit log</span><span class="hu-row-sub">${escapeHtml(String(e?.message || e))}</span></div>`;
+        return;
+      }
+
+      // Halo returns four parallel audit arrays on the ticket payload:
+      //   audit_log    — general entries (status changes, field edits, etc.)
+      //   auditstatus  — status-only changes
+      //   auditunum    — agent / assignee changes
+      //   auditdate    — date-field changes
+      const candidateKeys = ['audit_log', 'auditstatus', 'auditunum', 'auditdate',
+                             'auditing', 'audit', 'audits', 'audit_trail', 'audit_history'];
+      candidateKeys.forEach(k => {
+        const v = ticket && ticket[k];
+        if (Array.isArray(v)) v.forEach(r => rows.push(r));
+      });
+    }
+
+    // Stash the path used so the header renderer can show a label.
+    HU.auditUsedSqlPath = usedSqlPath;
 
     // Pre-fetch API-backed lookups for any field in the rows that we
     // resolve via /api (workflow, impact, urgency). Halo's localStorage
@@ -6412,7 +6667,11 @@ ${orderBy}
     // so the user can drill in on a specific field without typing.
     const header = document.createElement('div');
     header.className = 'hu-audit-header';
+    const visibilityNote = HU.auditUsedSqlPath
+      ? ''
+      : '<div class="hu-row hu-audit-vis-note" style="border-bottom:0;color:#7a6a3c;background:rgba(245,158,11,0.08);border-left:3px solid #f59e0b;padding:6px 10px;margin-bottom:6px"><span class="hu-row-sub" style="color:#7a6a3c">Showing your changes + system changes. Halo\'s API filters the audit log to the calling agent; the full multi-agent history is only available to roles with /api/Report access.</span></div>';
     header.innerHTML = `
+      ${visibilityNote}
       <div class="hu-row" style="border-bottom:0">
         <span class="hu-row-title" id="hu-audit-headline">Loading audit summary…</span>
         <span class="hu-row-sub">Newest first. Filter below to drill in.</span>
@@ -6422,6 +6681,7 @@ ${orderBy}
         <span class="hu-audit-filter-count" id="hu-audit-filter-count"></span>
       </div>
       <div class="hu-audit-field-chips" id="hu-audit-field-chips"></div>
+      <div class="hu-audit-field-chips" id="hu-audit-agent-chips" style="margin-top:6px"></div>
     `;
     body.appendChild(header);
 
@@ -6632,6 +6892,57 @@ ${orderBy}
       });
     }
 
+    // Agent chips — same UX as field chips, lets the user filter to one or
+    // more people. tx.who is already the resolved display name (username
+    // string or cache_agent lookup or "System"), so the chip labels match
+    // exactly what the user sees in the timeline.
+    const agentCounts = new Map();
+    enriched.forEach(tx => {
+      const who = String(tx.who || '').trim() || 'Unknown';
+      agentCounts.set(who, (agentCounts.get(who) || 0) + 1);
+    });
+    const agentList = [...agentCounts.entries()]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+
+    const selectedAgents = new Set();
+    const agentHost = document.getElementById('hu-audit-agent-chips');
+    if (agentHost && agentList.length > 1) {
+      const allChip = document.createElement('button');
+      allChip.type = 'button';
+      allChip.className = 'hu-audit-chip is-active';
+      allChip.dataset.agent = '';
+      allChip.textContent = 'All people';
+      agentHost.appendChild(allChip);
+
+      agentList.forEach(([who, count]) => {
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'hu-audit-chip';
+        chip.dataset.agent = who;
+        chip.innerHTML = `${escapeHtml(who)} <span class="hu-audit-chip-count">${count}</span>`;
+        agentHost.appendChild(chip);
+      });
+
+      agentHost.addEventListener('click', (e) => {
+        const chip = e.target.closest('.hu-audit-chip');
+        if (!chip) return;
+        const who = chip.dataset.agent;
+        if (who === '') {
+          selectedAgents.clear();
+        } else if (selectedAgents.has(who)) {
+          selectedAgents.delete(who);
+        } else {
+          selectedAgents.add(who);
+        }
+        agentHost.querySelectorAll('.hu-audit-chip').forEach(el => {
+          const isAll = el.dataset.agent === '';
+          const active = isAll ? selectedAgents.size === 0 : selectedAgents.has(el.dataset.agent);
+          el.classList.toggle('is-active', active);
+        });
+        render(document.getElementById('hu-audit-filter')?.value || '');
+      });
+    }
+
     const listsHost = document.createElement('div');
     body.appendChild(listsHost);
 
@@ -6639,25 +6950,89 @@ ${orderBy}
     // grouped list so empty groups can disappear cleanly when filtered.
     // Filters compose: text filter AND (no fields selected OR transaction
     // touches at least one selected field).
+    // Predicate helpers — defined here so we can apply subsets of the filters
+    // when computing chip counts (e.g. field chip counts should respect text+agent
+    // filters but NOT the field filter itself, otherwise selecting one field
+    // would zero every other field chip).
+    function matchesText(tx, lower) { return !lower || tx.searchBlob.includes(lower); }
+    function matchesAgents(tx, agentSet) {
+      if (!agentSet || !agentSet.size) return true;
+      const who = String(tx.who || '').trim() || 'Unknown';
+      return agentSet.has(who);
+    }
+    function matchesFields(tx, fieldSet) {
+      if (!fieldSet || !fieldSet.size) return true;
+      if (tx.changes.some(c => fieldSet.has((c.fieldLabel || '').trim()))) return true;
+      return (tx.virtualFields || []).some(f => fieldSet.has((f || '').trim()));
+    }
+
     function render(filterText) {
       const lower = (filterText || '').trim().toLowerCase();
       listsHost.innerHTML = '';
       const hasFieldFilter = selectedFields.size > 0;
-      const filtered = enriched.filter(tx => {
-        if (lower && !tx.searchBlob.includes(lower)) return false;
-        if (hasFieldFilter) {
-          const realMatch = tx.changes.some(c => selectedFields.has((c.fieldLabel || '').trim()));
-          if (realMatch) return true;
-          // Virtual fields cover inferred initial state on Ticket Created.
-          const virtualMatch = (tx.virtualFields || []).some(f => selectedFields.has((f || '').trim()));
-          return virtualMatch;
-        }
-        return true;
+      const hasAgentFilter = selectedAgents.size > 0;
+
+      const filtered = enriched.filter(tx =>
+        matchesText(tx, lower) && matchesAgents(tx, selectedAgents) && matchesFields(tx, selectedFields)
+      );
+
+      // Chip count recomputes — each chip set excludes its own filter from
+      // the upstream filter chain, so selecting one field doesn't hide the
+      // other field chips, and selecting one agent doesn't hide the other
+      // agents. Same pattern as e-commerce faceted search.
+      const forFieldCounts = enriched.filter(tx =>
+        matchesText(tx, lower) && matchesAgents(tx, selectedAgents)
+      );
+      const forAgentCounts = enriched.filter(tx =>
+        matchesText(tx, lower) && matchesFields(tx, selectedFields)
+      );
+
+      const liveFieldCounts = new Map();
+      forFieldCounts.forEach(tx => {
+        const hasVirtual = !!(tx.virtualFields && tx.virtualFields.length);
+        tx.changes.forEach(c => {
+          const label = (c.fieldLabel || '').trim();
+          if (!label) return;
+          if (c.isCreation && hasVirtual) return;
+          liveFieldCounts.set(label, (liveFieldCounts.get(label) || 0) + 1);
+        });
+        (tx.virtualFields || []).forEach(label => {
+          const k = String(label || '').trim();
+          if (k) liveFieldCounts.set(k, (liveFieldCounts.get(k) || 0) + 1);
+        });
+      });
+
+      const liveAgentCounts = new Map();
+      forAgentCounts.forEach(tx => {
+        const who = String(tx.who || '').trim() || 'Unknown';
+        liveAgentCounts.set(who, (liveAgentCounts.get(who) || 0) + 1);
+      });
+
+      // Apply to existing chips: update count, hide chips with zero matches
+      // unless they're currently selected (so the user can always deselect).
+      chipsHost?.querySelectorAll('.hu-audit-chip').forEach(el => {
+        const field = el.dataset.field;
+        if (field == null || field === '') return;
+        const count = liveFieldCounts.get(field) || 0;
+        const sel = selectedFields.has(field);
+        el.classList.toggle('is-empty', count === 0 && !sel);
+        const cEl = el.querySelector('.hu-audit-chip-count');
+        if (cEl) cEl.textContent = count;
+      });
+
+      agentHost?.querySelectorAll('.hu-audit-chip').forEach(el => {
+        const who = el.dataset.agent;
+        if (who == null || who === '') return;
+        const count = liveAgentCounts.get(who) || 0;
+        const sel = selectedAgents.has(who);
+        el.classList.toggle('is-empty', count === 0 && !sel);
+        const cEl = el.querySelector('.hu-audit-chip-count');
+        if (cEl) cEl.textContent = count;
       });
 
       const countEl = document.getElementById('hu-audit-filter-count');
       if (countEl) {
-        const showCount = lower || hasFieldFilter;
+        const showCount = lower || hasFieldFilter || hasAgentFilter;
         countEl.textContent = showCount
           ? `${filtered.length} match${filtered.length === 1 ? '' : 'es'}`
           : '';
@@ -8760,7 +9135,7 @@ ${orderBy}
     wrap.className = 'hu-360-note-editor';
     wrap.dataset.kind = 'note';
     wrap.innerHTML = `
-      <textarea class="hu-360-note-text" rows="4" placeholder="Add a note for this ticket..."></textarea>
+      <textarea class="hu-360-note-text" rows="4" placeholder="Add a note for this ticket... type @ to mention an agent"></textarea>
       <div class="hu-360-note-actions">
         <label class="hu-360-note-visibility">
           <input type="checkbox" class="hu-360-note-hidden"> Hidden from end user
@@ -8776,7 +9151,10 @@ ${orderBy}
 
     const ta = wrap.querySelector('.hu-360-note-text');
     const status = wrap.querySelector('.hu-360-note-status');
+    const mentions = [];
     ta.focus();
+
+    wireMentionAutocomplete(ta, mentions);
 
     wrap.querySelector('.hu-360-note-cancel').addEventListener('click', closeInlineNoteEditor);
     wrap.querySelector('.hu-360-note-save').addEventListener('click', async () => {
@@ -8785,9 +9163,16 @@ ${orderBy}
       const hidden = wrap.querySelector('.hu-360-note-hidden').checked;
       status.textContent = 'Saving…';
       try {
+        const noteHtml = buildNoteHtmlWithMentions(ta.value, mentions);
         await haloApiRequest('/api/actions', {
           method: 'POST',
-          body: [{ ticket_id: Number(ticketId), note, hiddenfromuser: hidden, outcome: hidden ? 'Private Note' : 'Public Note' }]
+          body: [{
+            ticket_id: Number(ticketId),
+            outcome_id: 7,
+            note,
+            note_html: noteHtml,
+            hiddenfromuser: hidden
+          }]
         });
         closeInlineNoteEditor();
         onSaved?.();
@@ -8797,7 +9182,243 @@ ${orderBy}
     });
   }
   function closeInlineNoteEditor() {
+    closeMentionPicker();
+    if (HU._noteEditorShield) { HU._noteEditorShield(); HU._noteEditorShield = null; }
     if (HU._noteEditor) { HU._noteEditor.remove(); HU._noteEditor = null; }
+  }
+
+  // @-mention autocomplete on a textarea. Detects `@query` at the cursor,
+  // shows a picker filtered against the cached agent list, and on selection
+  // inserts `@Display Name ` at the cursor + pushes {id, name} to `mentions`.
+  // `buildNoteHtmlWithMentions` walks the saved text and converts each tracked
+  // mention into Halo's chip span (data-mentionagent attr triggers the in-app
+  // notification on the server side).
+  function wireMentionAutocomplete(textarea, mentions) {
+    let token = 0;
+
+    // Halo's React app installs document-level keydown handlers that swallow
+    // characters like `@` before they reach our textarea. Register a window-
+    // level capture-phase listener so we fire ahead of Halo's listeners and
+    // stop propagation for any keystroke targeting our textarea. The default
+    // action (inserting the character) still happens.
+    const shieldKeys = (e) => {
+      if (e.target === textarea) e.stopPropagation();
+    };
+    window.addEventListener('keydown', shieldKeys, true);
+    window.addEventListener('keypress', shieldKeys, true);
+    window.addEventListener('keyup', shieldKeys, true);
+    HU._noteEditorShield = () => {
+      window.removeEventListener('keydown', shieldKeys, true);
+      window.removeEventListener('keypress', shieldKeys, true);
+      window.removeEventListener('keyup', shieldKeys, true);
+    };
+
+    const handleInput = () => {
+      const trigger = detectMentionTrigger(textarea, mentions);
+      if (!trigger) { closeMentionPicker(); return; }
+      const myToken = ++token;
+      loadMentionAgents().then(agents => {
+        if (myToken !== token) return;
+        const filtered = filterAgentsForMention(agents, trigger.query).slice(0, 8);
+        showMentionPicker(textarea, trigger, filtered, mentions);
+      });
+    };
+
+    textarea.addEventListener('input', handleInput);
+    textarea.addEventListener('keydown', e => {
+      const picker = HU._mentionPicker;
+      if (!picker) return;
+      if (e.key === 'ArrowDown') { e.preventDefault(); moveMentionPickerActive(1); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); moveMentionPickerActive(-1); }
+      else if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        commitActiveMention();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        closeMentionPicker();
+      }
+    });
+    textarea.addEventListener('blur', () => {
+      setTimeout(() => {
+        if (HU._mentionPicker && !HU._mentionPicker.pop.contains(document.activeElement)) {
+          closeMentionPicker();
+        }
+      }, 120);
+    });
+  }
+
+  function detectMentionTrigger(textarea, mentions) {
+    const pos = textarea.selectionStart;
+    if (pos !== textarea.selectionEnd) return null;
+    const text = textarea.value;
+    const before = text.slice(0, pos);
+    const match = before.match(/(?:^|[\s(])@([^\s@][^\n@]{0,40})?$/);
+    if (!match) return null;
+    const fullLen = match[0].length - (match[0].startsWith('@') ? 0 : 1);
+    const atIndex = pos - fullLen;
+    if (mentions && mentions.some(m => text.startsWith(`@${m.name}`, atIndex))) return null;
+    return {
+      query: (match[1] || '').trim(),
+      atIndex,
+      cursor: pos
+    };
+  }
+
+  function loadMentionAgents() {
+    if (!HU._mentionAgentsPromise) {
+      HU._mentionAgentsPromise = haloApiRequest('/api/agent?count=500')
+        .then(resp => extractEntityList(resp, 'agents') || [])
+        .catch(() => []);
+    }
+    return HU._mentionAgentsPromise;
+  }
+
+  function filterAgentsForMention(agents, query) {
+    const q = String(query || '').toLowerCase();
+    const enabled = agents.filter(a => a && a.name && !a.inactive);
+    if (!q) return enabled;
+    const starts = [];
+    const contains = [];
+    for (const a of enabled) {
+      const n = a.name.toLowerCase();
+      if (n.startsWith(q)) starts.push(a);
+      else if (n.includes(q)) contains.push(a);
+    }
+    return [...starts, ...contains];
+  }
+
+  function showMentionPicker(textarea, trigger, agents, mentions) {
+    closeMentionPicker();
+    const pop = document.createElement('div');
+    pop.className = 'hu-360-mention-pop';
+    const list = document.createElement('div');
+    list.className = 'hu-360-mention-list';
+    pop.appendChild(list);
+    document.body.appendChild(pop);
+
+    const rect = textarea.getBoundingClientRect();
+    const POP_WIDTH = 260;
+    const POP_HEIGHT = 220;
+    const margin = 8;
+    let left = rect.left + 8;
+    let top = rect.bottom + 4;
+    if (left + POP_WIDTH > window.innerWidth - margin) {
+      left = Math.max(margin, window.innerWidth - POP_WIDTH - margin);
+    }
+    if (rect.bottom + POP_HEIGHT + margin > window.innerHeight) {
+      top = Math.max(margin, rect.top - 4 - POP_HEIGHT);
+    }
+    pop.style.left = Math.round(left) + 'px';
+    pop.style.top = Math.round(top) + 'px';
+
+    HU._mentionPicker = { pop, list, textarea, trigger, agents, active: 0, mentions };
+
+    if (!agents.length) {
+      const empty = document.createElement('div');
+      empty.className = 'hu-360-mention-empty';
+      empty.textContent = 'No matching agents';
+      list.appendChild(empty);
+      return;
+    }
+
+    agents.forEach((a, i) => {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'hu-360-mention-row' + (i === 0 ? ' is-active' : '');
+      const team = a.team || (Array.isArray(a.teams) && a.teams[0] && (a.teams[0].team_name || a.teams[0].name)) || '';
+      row.innerHTML = `
+        <span class="hu-360-mention-name"></span>
+        ${team ? '<span class="hu-360-mention-team"></span>' : ''}
+      `;
+      row.querySelector('.hu-360-mention-name').textContent = a.name;
+      if (team) row.querySelector('.hu-360-mention-team').textContent = team;
+      row.addEventListener('mousedown', e => {
+        e.preventDefault();
+        selectMention(i);
+      });
+      list.appendChild(row);
+    });
+  }
+
+  function moveMentionPickerActive(delta) {
+    const picker = HU._mentionPicker;
+    if (!picker || !picker.agents.length) return;
+    picker.active = (picker.active + delta + picker.agents.length) % picker.agents.length;
+    picker.list.querySelectorAll('.hu-360-mention-row').forEach((r, i) => {
+      r.classList.toggle('is-active', i === picker.active);
+      if (i === picker.active) r.scrollIntoView({ block: 'nearest' });
+    });
+  }
+
+  function commitActiveMention() {
+    const picker = HU._mentionPicker;
+    if (!picker || !picker.agents.length) return;
+    selectMention(picker.active);
+  }
+
+  function selectMention(index) {
+    const picker = HU._mentionPicker;
+    if (!picker) return;
+    const agent = picker.agents[index];
+    if (!agent) { closeMentionPicker(); return; }
+    const ta = picker.textarea;
+    const { atIndex, cursor } = picker.trigger;
+    const insertion = `@${agent.name} `;
+    const newValue = ta.value.slice(0, atIndex) + insertion + ta.value.slice(cursor);
+    ta.value = newValue;
+    const newPos = atIndex + insertion.length;
+    ta.selectionStart = ta.selectionEnd = newPos;
+    picker.mentions.push({ id: Number(agent.id), name: agent.name, atIndex });
+    closeMentionPicker();
+    ta.focus();
+  }
+
+  function closeMentionPicker() {
+    if (HU._mentionPicker) {
+      HU._mentionPicker.pop.remove();
+      HU._mentionPicker = null;
+    }
+  }
+
+  function buildNoteHtmlWithMentions(plainText, mentions) {
+    const consumed = [];
+    // Prefer the original insertion position when it still matches — handles
+    // the case where the user typed "@Name" literally elsewhere before picking
+    // a mention for the same agent. Fall back to indexOf scanning only when
+    // text edits have shifted the chip's position.
+    for (const m of mentions) {
+      const literal = `@${m.name}`;
+      if (Number.isInteger(m.atIndex) && plainText.startsWith(literal, m.atIndex)) {
+        const end = m.atIndex + literal.length;
+        const overlap = consumed.some(c => !(end <= c.start || m.atIndex >= c.end));
+        if (!overlap) {
+          consumed.push({ start: m.atIndex, end, mention: m });
+          continue;
+        }
+      }
+      let from = 0;
+      while (from <= plainText.length) {
+        const idx = plainText.indexOf(literal, from);
+        if (idx === -1) break;
+        const end = idx + literal.length;
+        const overlap = consumed.some(c => !(end <= c.start || idx >= c.end));
+        if (!overlap) {
+          consumed.push({ start: idx, end, mention: m });
+          break;
+        }
+        from = idx + 1;
+      }
+    }
+    consumed.sort((a, b) => a.start - b.start);
+    let html = '';
+    let cursor = 0;
+    for (const c of consumed) {
+      html += escapeHtml(plainText.slice(cursor, c.start));
+      html += `<span data-mentionagent="${c.mention.id}" class="fr-deletable fr-tribute"><a>${escapeHtml('@' + c.mention.name)}</a></span>`;
+      cursor = c.end;
+    }
+    html += escapeHtml(plainText.slice(cursor));
+    return `<p>${html.replace(/\n/g, '<br>')}</p>`;
   }
 
   // Inline time-entry editor — adds a time-logged action to the ticket.
@@ -8976,7 +9597,8 @@ ${orderBy}
     HU._ticket360RefreshTimer = setTimeout(() => {
       HU._ticket360RefreshTimer = null;
       if (!document.getElementById('hu-ticket360-drawer')) return;
-      // Re-run openTicket360Panel — it re-fetches and re-renders in place.
+      const tid = HU.ticket360TicketId;
+      if (tid) delete HU.ticketRecordPromises[String(tid)];
       openTicket360Panel().catch(() => {});
     }, delayMs || 600);
   }
@@ -9182,7 +9804,7 @@ ${orderBy}
       body.style.padding = '0';
       body.innerHTML = `<div style="padding:14px"><div class="hu-row"><span class="hu-row-title">Loading dashboard...</span></div></div>`;
       openDrawer(drawer);
-      document.getElementById('hu-360-inject-btn')?.classList.add('is-active');
+      document.querySelectorAll('.hu-360-inject-btn').forEach(b => b.classList.add('is-active'));
     }
 
     // Show the header spinner while the (re-)fetch is in flight.
@@ -9956,7 +10578,7 @@ ${orderBy}
             const row = document.createElement('div');
             row.className = 'hu-360-act-row';
             row.innerHTML = `<span class="hu-360-act-label">${escapeHtml(label)}</span>
-              <div class="hu-360-act-track"><div class="hu-360-act-fill" style="width:${Math.round(count / maxCount * 100)}%;background:${color}"></div></div>
+              <div class="hu-360-act-track"><div class="hu-360-act-fill" style="width:${Math.round(count / maxCount * 100)}%;background:${safeColor(color)}"></div></div>
               <span class="hu-360-act-count">${count}</span>`;
             actCard.appendChild(row);
           });
@@ -10118,7 +10740,7 @@ ${orderBy}
     row.className = 'hu-360-tl-row';
     row.innerHTML = `
       <div class="hu-360-tl-gutter">
-        <div class="hu-360-tl-dot" style="background:${color}"></div>
+        <div class="hu-360-tl-dot" style="background:${safeColor(color)}"></div>
         ${!isLast ? '<div class="hu-360-tl-line"></div>' : ''}
       </div>
       <div class="hu-360-tl-body">
@@ -11262,32 +11884,7 @@ ${orderBy}
         return;
       }
 
-      body.innerHTML = '';
-      const jsonText = JSON.stringify(row, null, 2);
-
-      const toolbar = document.createElement('div');
-      toolbar.className = 'hu-toolbar-row';
-      toolbar.innerHTML = `
-        <div>
-          <span class="hu-row-title">${escapeHtml(record.type)} ${escapeHtml(record.id)}</span>
-          <span class="hu-row-sub">GET ${escapeHtml(record.apiPath)}</span>
-        </div>
-        <button class="hu-copy hu-copy-json" title="Copy JSON to clipboard">Copy JSON</button>
-      `;
-      body.appendChild(toolbar);
-
-      const copyBtn = toolbar.querySelector('.hu-copy-json');
-      copyBtn.addEventListener('click', () => {
-        navigator.clipboard?.writeText(jsonText).then(() => {
-          copyBtn.textContent = 'Copied!';
-          setTimeout(() => { copyBtn.textContent = 'Copy JSON'; }, 2000);
-        });
-      });
-
-      const pre = document.createElement('pre');
-      pre.className = 'hu-json-formatted';
-      pre.textContent = jsonText;
-      body.appendChild(pre);
+      renderJsonInspector(body, row, record);
     } catch (error) {
       const msg = (error && error.message) || String(error || '');
       const isPerm = isReportPermissionError(msg);
@@ -11299,6 +11896,256 @@ ${orderBy}
         : (msg || 'Unknown error.');
       body.innerHTML = '<div class="hu-row"><span class="hu-row-title">' + escapeHtml(title) + '</span><span class="hu-row-sub">' + escapeHtml(detail) + '</span></div>';
     }
+  }
+
+  function renderJsonInspector(body, row, record) {
+    body.innerHTML = '';
+    const jsonText = JSON.stringify(row, null, 2);
+    let viewMode = 'tree';
+
+    const toolbar = document.createElement('div');
+    toolbar.className = 'hu-json-toolbar';
+    toolbar.innerHTML = `
+      <div class="hu-json-toolbar-meta">
+        <span class="hu-row-title">${escapeHtml(record.type)} ${escapeHtml(record.id)}</span>
+        <span class="hu-row-sub">GET ${escapeHtml(record.apiPath)}</span>
+      </div>
+      <div class="hu-json-toolbar-controls">
+        <input type="search" class="hu-json-search" placeholder="Search keys or values..." aria-label="Search JSON" />
+        <div class="hu-json-view-toggle" role="tablist">
+          <button class="hu-json-view-btn is-active" data-view="tree" type="button">Tree</button>
+          <button class="hu-json-view-btn" data-view="raw" type="button">Raw</button>
+        </div>
+        <button class="hu-json-action hu-json-expand" type="button" title="Expand all nodes">Expand all</button>
+        <button class="hu-json-action hu-json-collapse" type="button" title="Collapse all nodes">Collapse all</button>
+        <button class="hu-copy hu-copy-json" type="button" title="Copy JSON to clipboard">Copy JSON</button>
+      </div>
+      <div class="hu-json-count"></div>
+    `;
+    body.appendChild(toolbar);
+
+    const treeHost = document.createElement('div');
+    treeHost.className = 'hu-json-tree';
+    body.appendChild(treeHost);
+
+    const rawHost = document.createElement('pre');
+    rawHost.className = 'hu-json-formatted hu-json-raw';
+    rawHost.style.display = 'none';
+    rawHost.textContent = jsonText;
+    body.appendChild(rawHost);
+
+    const rootNode = buildJsonNode('$', row, '', 0, true);
+    treeHost.appendChild(rootNode);
+
+    const searchInput = toolbar.querySelector('.hu-json-search');
+    const expandBtn = toolbar.querySelector('.hu-json-expand');
+    const collapseBtn = toolbar.querySelector('.hu-json-collapse');
+    const countEl = toolbar.querySelector('.hu-json-count');
+    const viewBtns = toolbar.querySelectorAll('.hu-json-view-btn');
+    const copyBtn = toolbar.querySelector('.hu-copy-json');
+
+    copyBtn.addEventListener('click', () => {
+      navigator.clipboard?.writeText(jsonText).then(() => {
+        copyBtn.textContent = 'Copied!';
+        setTimeout(() => { copyBtn.textContent = 'Copy JSON'; }, 1500);
+      });
+    });
+
+    function setAllExpansion(expanded) {
+      treeHost.querySelectorAll('.hu-json-node.is-collapsible').forEach(n => {
+        n.classList.toggle('is-open', expanded);
+      });
+    }
+    expandBtn.addEventListener('click', () => setAllExpansion(true));
+    collapseBtn.addEventListener('click', () => setAllExpansion(false));
+
+    function setView(mode) {
+      viewMode = mode;
+      viewBtns.forEach(b => b.classList.toggle('is-active', b.dataset.view === mode));
+      treeHost.style.display = mode === 'tree' ? '' : 'none';
+      rawHost.style.display = mode === 'raw' ? '' : 'none';
+      expandBtn.style.display = mode === 'tree' ? '' : 'none';
+      collapseBtn.style.display = mode === 'tree' ? '' : 'none';
+      applySearch(searchInput.value);
+    }
+    viewBtns.forEach(btn => btn.addEventListener('click', () => setView(btn.dataset.view)));
+
+    function applySearch(query) {
+      const q = String(query || '').trim().toLowerCase();
+      if (viewMode === 'tree') {
+        const matches = filterJsonTree(treeHost, q);
+        countEl.textContent = q ? `${matches} match${matches === 1 ? '' : 'es'}` : '';
+      } else {
+        renderRawWithHighlight(rawHost, jsonText, q);
+        countEl.textContent = q ? '' : '';
+      }
+    }
+    searchInput.addEventListener('input', e => applySearch(e.target.value));
+
+    setView('tree');
+  }
+
+  function buildJsonNode(key, value, parentPath, depth, isRoot) {
+    const node = document.createElement('div');
+    node.className = 'hu-json-node';
+    const path = isRoot
+      ? '$'
+      : (typeof key === 'number'
+          ? `${parentPath}[${key}]`
+          : (parentPath === '$' ? key : `${parentPath}.${key}`));
+    node.dataset.path = path;
+
+    const type = jsonValueType(value);
+    const isContainer = type === 'object' || type === 'array';
+
+    if (isContainer) {
+      const entries = type === 'array'
+        ? value.map((v, i) => [i, v])
+        : Object.entries(value);
+      const count = entries.length;
+
+      node.classList.add('is-collapsible');
+      if (depth < 1) node.classList.add('is-open');
+
+      const header = document.createElement('div');
+      header.className = 'hu-json-node-header';
+
+      const arrow = document.createElement('span');
+      arrow.className = 'hu-json-arrow';
+      arrow.textContent = '▶';
+      header.appendChild(arrow);
+
+      const keySpan = document.createElement('span');
+      keySpan.className = 'hu-json-key';
+      keySpan.textContent = isRoot ? '$' : (typeof key === 'number' ? `[${key}]` : key);
+      header.appendChild(keySpan);
+
+      if (!isRoot) {
+        const sep = document.createElement('span');
+        sep.className = 'hu-json-sep';
+        sep.textContent = ':';
+        header.appendChild(sep);
+      }
+
+      const summary = document.createElement('span');
+      summary.className = 'hu-json-summary';
+      summary.textContent = type === 'array' ? `[ ${count} ]` : `{ ${count} }`;
+      header.appendChild(summary);
+
+      const copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.className = 'hu-copy hu-json-copy-btn';
+      copyBtn.title = 'Copy path';
+      copyBtn.textContent = 'Copy path';
+      copyBtn.addEventListener('click', e => { e.stopPropagation(); copyText(path); });
+      header.appendChild(copyBtn);
+
+      header.addEventListener('click', () => node.classList.toggle('is-open'));
+      node.appendChild(header);
+
+      const childrenHost = document.createElement('div');
+      childrenHost.className = 'hu-json-children';
+      entries.forEach(([k, v]) => {
+        childrenHost.appendChild(buildJsonNode(k, v, path, depth + 1, false));
+      });
+      node.appendChild(childrenHost);
+
+      node.dataset.searchText = (isRoot ? '' : String(key)).toLowerCase();
+    } else {
+      const leaf = document.createElement('div');
+      leaf.className = 'hu-json-leaf';
+
+      const keySpan = document.createElement('span');
+      keySpan.className = 'hu-json-key';
+      keySpan.textContent = typeof key === 'number' ? `[${key}]` : key;
+      leaf.appendChild(keySpan);
+
+      const sep = document.createElement('span');
+      sep.className = 'hu-json-sep';
+      sep.textContent = ': ';
+      leaf.appendChild(sep);
+
+      const valueSpan = document.createElement('span');
+      valueSpan.className = `hu-json-value hu-json-${type}`;
+      const formatted = formatJsonLeaf(value, type);
+      valueSpan.textContent = formatted;
+      leaf.appendChild(valueSpan);
+
+      const copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.className = 'hu-copy hu-json-copy-btn';
+      copyBtn.title = 'Copy value';
+      copyBtn.textContent = 'Copy';
+      copyBtn.addEventListener('click', e => {
+        e.stopPropagation();
+        copyText(type === 'string' ? String(value) : formatted);
+      });
+      leaf.appendChild(copyBtn);
+
+      node.appendChild(leaf);
+      node.dataset.searchText = `${String(key)} ${formatted}`.toLowerCase();
+    }
+
+    return node;
+  }
+
+  function jsonValueType(v) {
+    if (v === null) return 'null';
+    if (Array.isArray(v)) return 'array';
+    return typeof v;
+  }
+
+  function formatJsonLeaf(value, type) {
+    if (type === 'null') return 'null';
+    if (type === 'string') return `"${value}"`;
+    if (type === 'undefined') return 'undefined';
+    return String(value);
+  }
+
+  function filterJsonTree(host, query) {
+    const allNodes = Array.from(host.querySelectorAll('.hu-json-node'));
+    allNodes.forEach(n => {
+      n.classList.remove('is-match', 'has-match', 'in-match-branch');
+      n.style.display = '';
+    });
+    if (!query) return 0;
+    let matchCount = 0;
+    allNodes.forEach(n => {
+      if (n.dataset.searchText && n.dataset.searchText.includes(query)) {
+        n.classList.add('is-match');
+        matchCount++;
+      }
+    });
+    allNodes.forEach(n => {
+      if (!n.classList.contains('is-match')) return;
+      let parent = n.parentElement;
+      while (parent && parent !== host) {
+        if (parent.classList && parent.classList.contains('hu-json-node')) {
+          parent.classList.add('has-match', 'is-open');
+        }
+        parent = parent.parentElement;
+      }
+      n.querySelectorAll('.hu-json-node').forEach(d => d.classList.add('in-match-branch'));
+      if (n.classList.contains('is-collapsible')) n.classList.add('is-open');
+    });
+    allNodes.forEach(n => {
+      const visible = n.classList.contains('is-match')
+        || n.classList.contains('has-match')
+        || n.classList.contains('in-match-branch');
+      if (!visible) n.style.display = 'none';
+    });
+    return matchCount;
+  }
+
+  function renderRawWithHighlight(pre, jsonText, query) {
+    if (!query) {
+      pre.textContent = jsonText;
+      return;
+    }
+    const escapedJson = escapeHtml(jsonText);
+    const escapedQuery = escapeHtml(query).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(escapedQuery, 'gi');
+    pre.innerHTML = escapedJson.replace(re, m => `<mark class="hu-json-mark">${m}</mark>`);
   }
 
   function detectCurrentRecordQuery() {
@@ -11380,33 +12227,6 @@ ${orderBy}
     }
 
     return null;
-  }
-
-  function renderJsonLines(object) {
-    return Object.entries(flattenObject(object)).map(([path, value]) => {
-      const line = document.createElement('div');
-      line.className = 'hu-json-line';
-      line.innerHTML = `
-        <span><span class="hu-json-path">${escapeHtml(path)}</span>: <span class="hu-json-value">${escapeHtml(formatValue(value))}</span></span>
-        <button class="hu-copy" title="Copy path and value">Copy</button>
-      `;
-      line.querySelector('.hu-copy').addEventListener('click', () => copyText(`${path}: ${formatValue(value)}`));
-      return line;
-    });
-  }
-
-  function flattenObject(value, prefix = '', out = {}) {
-    if (value === null || typeof value !== 'object') {
-      out[prefix || 'value'] = value;
-      return out;
-    }
-
-    Object.entries(value).forEach(([key, child]) => {
-      const next = prefix ? `${prefix}.${key}` : key;
-      if (child && typeof child === 'object' && !Array.isArray(child)) flattenObject(child, next, out);
-      else out[next] = child;
-    });
-    return out;
   }
 
   function getPushTarget() {
@@ -11520,8 +12340,11 @@ ${orderBy}
       removePushMode();
       showHaloMenu();
       showHaloSidebars();
-      document.getElementById('hu-360-inject-btn')?.classList.remove('is-active');
+      document.querySelectorAll('.hu-360-inject-btn').forEach(b => b.classList.remove('is-active'));
       stopTicket360LiveUpdates();
+      closeAgentPicker();
+      closeTicketChoicePicker();
+      closeInlineNoteEditor();
     }
     el.style.transform = 'translateX(calc(100% + 40px))';
     el.addEventListener('transitionend', () => el.remove(), { once: true });
@@ -11561,6 +12384,15 @@ ${orderBy}
       '"': '&quot;',
       "'": '&#39;'
     }[char]));
+  }
+
+  // Validate a color before interpolating it into a `style=` attribute.
+  // Accepts hex (#abc / #aabbcc / #aabbccdd) and rgb/rgba(...) — rejects
+  // anything else (function-like values, url(), CSS variables, etc.) that
+  // could break out of the attribute and inject markup.
+  function safeColor(value) {
+    const raw = String(value ?? '').trim();
+    return /^(#[0-9a-f]{3,8}|rgb(a)?\([^)]+\))$/i.test(raw) ? raw : '';
   }
 
   function copyText(value) {
@@ -11978,7 +12810,7 @@ ${orderBy}
       btn.className = 'solidbutton fabtn notext hu-360-inject-btn';
       btn.type = 'button';
       btn.title = 'Toggle Ticket 360 dashboard';
-      btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="white" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="2" width="14" height="12" rx="1.5"/><line x1="10" y1="2" x2="10" y2="14"/><line x1="1" y1="6.5" x2="10" y2="6.5"/><line x1="1" y1="10.5" x2="10" y2="10.5"/></svg>`;
+      btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="2" width="14" height="12" rx="1.5"/><line x1="10" y1="2" x2="10" y2="14"/><line x1="1" y1="6.5" x2="10" y2="6.5"/><line x1="1" y1="10.5" x2="10" y2="10.5"/></svg>`;
       if (drawerOpen) btn.classList.add('is-active');
       btn.addEventListener('click', e => {
         e.stopPropagation();
@@ -12738,6 +13570,11 @@ WHERE COLUMN_NAME LIKE 'CF%'
   }
 
   function initEmailVarAutocomplete() {
+    // Document-level listeners installed once at startup and intentionally
+    // never removed. Halo's template-editor fields can mount/unmount any time
+    // the user navigates between settings panes, so we listen at the document
+    // level rather than attaching per-field. All handlers early-return when
+    // the target isn't a template field, so the cost when idle is negligible.
     loadEmailVarCatalog();
     document.addEventListener('input', handleEmailFieldInput, true);
     document.addEventListener('keydown', handleEmailFieldKey, true);

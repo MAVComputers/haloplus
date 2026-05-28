@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.3.3
+
+### Ticket 360 — inline note editor
+- **@-mentions.** Type `@` in a Ticket 360 note to open an agent picker. Live search, keyboard nav (Up / Down / Enter / Tab / Esc), click to pick. Selected mentions become Halo chips in the saved note and trigger Halo's in-app notification to the mentioned agent. Picker clamps to the viewport (flips up when there's no room below, snaps to the right edge on narrow drawers).
+- **Note payload aligned with Halo's UI.** The inline note editor now posts `outcome_id: 7` (Note Added) instead of the legacy `outcome: "Public Note" / "Private Note"` strings — those didn't match any real outcome on most tenants and were getting silently rewritten by Halo on save. Notes now also carry a `note_html` payload alongside the plain `note`, which is what `@`-mention chip rendering relies on.
+
+### Audit log drawer
+- **Multi-agent visibility via SQL fallback.** When the agent has `/api/Report` permission, the audit drawer pulls from the `AUDIT` table directly so every agent's changes appear — not just the current user's. Tenants without report access keep the entity-API path (and see an amber visibility note explaining the limitation).
+- **Faceted filters.** New chip rows for agents and field names sit above the change list. Click a chip to filter; chips with no matches under the current filter combination are greyed out instead of hiding, so you can see what's available. Free-text filter narrows further on top.
+- **Actions table merged into the same drawer.** Notes, status changes, re-assigns, and emails from `/api/actions` now appear in the audit feed alongside the structural changes from `AUDIT`, sorted by timestamp.
+
+### JSON inspector
+- **Rebuilt with a real tree.** Tree view shows collapsible nodes with colour-coded keys, strings, numbers, booleans, and `null`; arrays and objects render their count `[3]` / `{12}` in the header. Raw view keeps the full pretty-printed JSON.
+- **Search across keys and values.** Tree mode filters branches, opens matched ancestors, and shows a match count. Raw mode highlights matches inline.
+- **Expand all / Collapse all** buttons (Tree mode), **per-node copy** (JSON path for containers, value for leaves), and a top-level Copy JSON button.
+
+### Ticket 360 fixes
+- **Customer change reflected on next refresh.** Changing the requester (customer / site / user) from the 360 panel showed the old name until a manual reload, because `scheduleTicket360Refresh` re-rendered from the cached ticket record. The cache is now invalidated before the re-fetch, so the new name appears immediately. Same fix applies to status, priority, agent, flag, and summary writes — every inline edit now reflects post-write state.
+- **Drawer close clears popovers.** Closing the 360 drawer now tears down the agent picker, status/priority picker, and inline note editor. Previously these could leak `document.mousedown` and `window.keydown` listeners after the drawer animated out.
+- **Mention chip targets the right `@Name`.** If the same agent name appeared earlier in the note as plain text (`Spoke to @Sander earlier`) and was then picked as a mention, the chip used to be applied to the wrong occurrence. The insertion position is now tracked per-mention and preferred at render time.
+- **`safeColor()` helper.** Centralises the hex/rgb validation that was inlined in three places, and applies it to the action-mix bar fill and timeline dot. Defends against any future cache shape change leaking unexpected values into a `style=` attribute.
+
+### Ticket 360 — Multi-Tab inject button styling
+- **Black icon when Ticket 360 isn't visible.** The CSS that styled the injected toolbar button used `button#hu-360-inject-btn`, but the multi-tab rewrite dropped the `id` (multiple tabs = multiple buttons, IDs would collide). Without the ID selector, Halo's default white-on-orange button styling rendered the icon white-on-white when the dashboard was closed. Switched to a triple-class selector (`button.hu-360-inject-btn.hu-360-inject-btn.hu-360-inject-btn`) to outweigh Halo's `.solidbutton.notext` specificity. The SVG also now uses `currentColor` so the icon follows the button's text colour through the active / inactive states.
+
+### Notes
+- v1.3.3 builds on v1.3.2 (which itself contained everything from the never-shipped v1.3.1 — Multi-Tab support and right-click context menu). If you skipped a version, the Chrome Web Store update brings you up to v1.3.3 directly.
+
 ## 1.3.2
 
 ### Critical fix

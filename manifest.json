@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "HaloPlus",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "description": "Productivity, workflow, and data tools for HaloITSM and HaloPSA.",
   "homepage_url": "https://www.gethaloplus.com",
   "permissions": [

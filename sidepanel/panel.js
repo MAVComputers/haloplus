@@ -23,6 +23,17 @@ const LAST_SEEN_VERSION_KEY = 'huLastSeenVersion';
 // belong in CHANGELOG.md. Only the entries for the current manifest version
 // are surfaced.
 const RELEASE_HIGHLIGHTS = {
+  '1.3.3': {
+    title: 'What\'s new in HaloPlus 1.3.3',
+    items: [
+      ['@-mentions in Ticket 360 notes', 'Type @ inside an inline note in the 360 drawer and a picker opens with your tenant\'s agents. Pick one and the saved note carries a Halo mention chip that triggers Halo\'s in-app notification to that agent. Live search, keyboard nav (Up / Down / Enter / Tab / Esc), and a small viewport-aware popup that flips up when there\'s no room below.'],
+      ['Audit log shows every agent\'s changes', 'If your role has /api/Report access, the audit drawer now reads the AUDIT table directly so every agent\'s edits appear (not just your own). New agent + field chip filters above the list, with empty chips greyed out instead of hidden so you can see what\'s available. Actions (notes, re-assigns, emails, status changes) are merged into the same feed.'],
+      ['JSON inspector — proper tree, search, expand/collapse', 'The "Open JSON inspector" command now opens a real inspector: collapsible tree with colour-coded values, Raw view for the full pretty-printed JSON, search across keys and values (with match count), Expand all / Collapse all, and per-node copy (JSON path for nested keys, value for leaves).'],
+      ['Customer / requester change shows up immediately', 'Changing the requester from the 360 drawer used to keep showing the old name until you reloaded the page. The 360 refresh now drops its cached ticket record before re-fetching, so the new name appears on the very next render. Same fix applies to status, priority, agent, flag, and summary edits.'],
+      ['Cleaner drawer close', 'Closing the 360 drawer now tidies up any open agent picker, status/priority picker, and inline note editor instead of leaving their event listeners orphaned in the page.'],
+      ['Black icon on the injected Ticket 360 button', 'When the dashboard was closed, the 360 button injected into Halo\'s toolbar was rendering white-on-white in Multi-Tab mode. Fixed — icon is black when the dashboard is hidden, white when it\'s open, with the orange active state in between.']
+    ]
+  },
   '1.3.2': {
     title: 'What\'s new in HaloPlus 1.3.2',
     items: [
