@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.3.4
+
+### Critical fix — search palette navigation
+- **Clicking a search result did nothing.** On current Halo builds the palette closed but never navigated. [main-world-bridge.js](content/main-world-bridge.js) looked for React Router's `history` via the `_reactRootContainer` expando, which React 16/17 exposed and React 18 removed in favour of `__reactContainer$` / `__reactFiber$`. The lookup found nothing, so navigation fell through to a `pushState` + `popstate` fallback that Halo's router ignores — the URL changed, the view didn't. The bridge now recognises the React 18 expandos, climbs to the host root, and walks the full fiber tree (child *and* sibling) instead of following `.child` for 25 levels. React Router v6's `navigator` and context-provider `value` shapes are recognised too. Reported in [#4](https://github.com/alexwennekes212/haloplus/issues/4) — thanks @bryansbt for the diagnosis.
+- **Navigation can no longer fail silently.** The bridge reports back on `haloplus:nav-result`, and `navigateTo()` falls back to a hard `location.assign()` when SPA navigation wasn't possible or the bridge doesn't answer within 250ms. v1.3.1 had removed that safety net to stop double-navigation, which left nothing to catch an unreachable router. Same-tab navigation additionally verifies the URL actually moved; Multi-Tab's `ADD_NEW_TAB` is exempt from that check so [#3](https://github.com/alexwennekes212/haloplus/issues/3) doesn't regress.
+
+### Action timeline — child and related tickets
+- **Roll child and related tickets into one feed.** Project and Problem tickets carry little activity of their own — the work happens on their children, and reviewing one meant opening every child in turn. The `/tl` drawer now has an **Include** row with *Child tickets* and *Related tickets* chips, built on Halo's `ischildnotes` / `isrelatednotes` action filters. The ticket's own actions are always included. Requested in [#5](https://github.com/alexwennekes212/haloplus/issues/5) — thanks @micahvirtuoso.
+- **Merged feeds stay readable.** Actions from another ticket carry a clickable `#id` badge that opens it; actions from the ticket you're on stay unbadged. The combined feed is re-sorted by timestamp rather than arriving in per-scope blocks, and an action returned by both the child and related filters appears once.
+- **Both scopes default off and remember your choice.** Each enabled scope is an extra API call, so nothing changes until you opt in; the selection then persists across tickets and sessions. A scope that errors (older Halo builds may not support these filters) shows a note and leaves the rest of the timeline intact.
+
 ## 1.3.3
 
 ### Ticket 360 — inline note editor
