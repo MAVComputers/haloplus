@@ -1031,15 +1031,25 @@
   }
 
   // SPA-navigate via the main-world bridge (content/main-world-bridge.js).
-  // React's `_reactRootContainer` expando and Redux's store are invisible
-  // from the isolated content-script world, so we signal across via
-  // CustomEvent. Two modes:
+  // React's internal fiber tree and Redux's store are invisible from the
+  // isolated content-script world, so we signal across via CustomEvent.
+  // Two modes:
   //   - openInNewHaloTab off OR multi-tab inactive: history.push() → replace
   //   - openInNewHaloTab on AND multi-tab active:   dispatch ADD_NEW_TAB
-  // CustomEvent `detail` is structured-cloned across worlds, so we can't
-  // read back a "handled" flag. Trust the bridge for same-origin and let
-  // it own the fallback if React Router isn't reachable. Only cross-origin
-  // URLs do a hard navigation here.
+  //
+  // The bridge answers on `haloplus:nav-result` with { nonce, ok }. When it
+  // reports failure — or never answers at all, e.g. the MAIN-world script was
+  // blocked — we fall back to the hard `location.assign()` that v1.3.0 used.
+  // v1.3.1 dropped that safety net to stop double-navigation, which turned an
+  // unreachable router into a silent no-op (issue #4).
+  const NAV_BRIDGE_TIMEOUT_MS = 250;
+  const NAV_VERIFY_MS = 250;
+  let navNonceSeq = 0;
+
+  function currentPath() {
+    return window.location.pathname + window.location.search + window.location.hash;
+  }
+
   function navigateTo(value) {
     const href = safeNavUrl(value);
     if (!href) return;
@@ -1052,10 +1062,46 @@
       window.location.assign(href);
       return;
     }
+
+    const target = url.pathname + url.search + url.hash;
+    const before = currentPath();
     const useNewTab = HU.settings.openInNewHaloTab && isHaloMultiTabActive();
     const eventName = useNewTab ? 'haloplus:open-new-tab' : 'haloplus:navigate';
+    const nonce = `hu-nav-${Date.now()}-${++navNonceSeq}`;
+
+    let settled = false;
+    let timer = null;
+
+    function finish(ok) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      window.removeEventListener('haloplus:nav-result', onResult);
+      if (!ok) window.location.assign(href);
+    }
+
+    function onResult(e) {
+      const d = e && e.detail;
+      if (!d || d.nonce !== nonce) return;
+      // The bridge answered, so the no-answer timer is no longer relevant.
+      clearTimeout(timer);
+      if (!d.ok) { finish(false); return; }
+      // ADD_NEW_TAB rewrites the path itself (plural → singular), so only the
+      // same-tab case can be verified against the URL we asked for.
+      if (useNewTab) { finish(true); return; }
+      // The router accepted the push — confirm the URL actually moved. Catches
+      // a stale `history` object that resolves but no longer drives the view.
+      timer = setTimeout(() => {
+        const now = currentPath();
+        finish(now !== before || now === target);
+      }, NAV_VERIFY_MS);
+    }
+
+    window.addEventListener('haloplus:nav-result', onResult);
+    timer = setTimeout(() => finish(false), NAV_BRIDGE_TIMEOUT_MS);
+
     window.dispatchEvent(new CustomEvent(eventName, {
-      detail: { path: url.pathname + url.search + url.hash }
+      detail: { path: target, nonce }
     }));
   }
 
