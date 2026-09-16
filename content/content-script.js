@@ -31,6 +31,11 @@
     suppressSlashUntil: 0,
     ticket360TicketId: 0,
     timelineTicketId: 0,
+    // Action-timeline scope (issue #5). Kept out of `settings` on purpose:
+    // the side panel's savePreferences() writes huSettings as a whole object
+    // from its own six known keys, so anything the content script stored
+    // there would be dropped the next time a preference is toggled.
+    timelineScope: { children: false, related: false },
     theme: 'light',
     settings: { auto360: true, drawer360Push: true, hideHaloSidebar: false, ticket360Enabled: true, doubleClickTechFields: true, openInNewHaloTab: false },
     palette: { placement: 'mid', fontScale: 1 },
@@ -315,7 +320,7 @@
     // Commands
     command('r',             'Recent records',    'Open the last 20 Halo records you visited', showRecentPanel,       ['recent', 'history', 'jump back']),
     command('360',           'Ticket 360',        'Open a full ticket context panel for the current ticket', openTicket360Panel, ['ticket360', 'ticket context', 'ticket summary', 'overview']),
-    command('tl',            'Action timeline',   'Show recent actions and communication for the current ticket', openActionTimelinePanel, ['timeline', 'actions', 'history', 'updates']),
+    command('tl',            'Action timeline',   'Recent actions for this ticket, optionally merged with its child and related tickets', openActionTimelinePanel, ['timeline', 'actions', 'history', 'updates', 'children', 'related', 'project', 'problem']),
     command('f',             'Toggle field API names', 'Show or hide API names beside form labels', toggleFieldOverlay, ['fields', 'api names', 'field overlay']),
     command('j',             'Inspect record JSON', 'Open raw record data and copy to clipboard', openJsonInspector,   ['json', 'payload', 'raw', 'api']),
     command('api',           'API reference',     'Browse all Halo REST API endpoints',    showApiReference,      ['rest', 'endpoints', 'developer', 'docs']),
@@ -2465,6 +2470,40 @@ FROM (
       .hu-audit-chip.is-empty:hover { color: #94a3b8; border-color: #d8dde8; }
       html.hu-theme-dark .hu-audit-chip.is-empty { color: #525d72; }
       html.hu-theme-dark .hu-audit-chip.is-empty:hover { color: #525d72; border-color: #303744; }
+
+      /* Action-timeline scope chips (issue #5) */
+      .hu-tl-scope {
+        display: flex; flex-wrap: wrap; align-items: center; gap: 5px;
+        margin: 0 0 10px;
+      }
+      .hu-tl-scope-label {
+        font-size: 10.5px; font-weight: 700; letter-spacing: 0.02em;
+        text-transform: uppercase; color: #8a94a6; margin-right: 2px;
+      }
+      html.hu-theme-dark .hu-tl-scope-label { color: #6b7688; }
+      .hu-audit-chip.is-locked { cursor: default; opacity: 0.75; }
+      .hu-audit-chip.is-locked:hover { border-color: #25343f; }
+      .hu-tl-scope-note {
+        flex-basis: 100%; font-size: 10.5px; color: #b45309;
+        background: #fffbeb; border: 1px solid #fde68a;
+        border-radius: 6px; padding: 5px 8px; margin-top: 2px;
+      }
+      html.hu-theme-dark .hu-tl-scope-note {
+        color: #fcd34d; background: rgba(180,83,9,0.12); border-color: rgba(252,211,77,0.28);
+      }
+      .hu-tl-source {
+        display: inline-block; margin-right: 5px; vertical-align: baseline;
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 10px; font-weight: 700; line-height: 1.5;
+        padding: 0 5px; border-radius: 4px; cursor: pointer;
+        border: 1px solid #c7d2fe; background: #eef2ff; color: #4338ca;
+        transition: background 0.12s, border-color 0.12s;
+      }
+      .hu-tl-source:hover { background: #e0e7ff; border-color: #a5b4fc; }
+      html.hu-theme-dark .hu-tl-source {
+        border-color: rgba(129,140,248,0.35); background: rgba(99,102,241,0.16); color: #a5b4fc;
+      }
+      html.hu-theme-dark .hu-tl-source:hover { background: rgba(99,102,241,0.26); }
       .hu-audit-change { padding: 2px 0; }
       .hu-audit-change + .hu-audit-change { border-top: 1px dashed rgba(0,0,0,0.04); margin-top: 2px; padding-top: 4px; }
       html.hu-theme-dark .hu-audit-change + .hu-audit-change { border-top-color: rgba(255,255,255,0.05); }
@@ -3987,6 +4026,16 @@ FROM (
       if (areaName !== 'local' || !changes.huSettings) return;
       Object.assign(HU.settings, changes.huSettings.newValue || {});
     });
+  }
+
+  function loadTimelineScope() {
+    storageGet(['huTimelineScope']).then(data => {
+      Object.assign(HU.timelineScope, data.huTimelineScope || {});
+    });
+  }
+
+  function saveTimelineScope() {
+    return storageSet({ huTimelineScope: { ...HU.timelineScope } });
   }
 
   function loadPaletteSettings() {
@@ -10514,6 +10563,23 @@ ${orderBy}
     return true;
   }
 
+  // Halo's /Actions endpoint can return a ticket's *children's* actions or its
+  // *related* tickets' actions instead of its own, via `ischildnotes` /
+  // `isrelatednotes`. Both are exclusive filters rather than additive flags, so
+  // a merged feed means one request per enabled scope (issue #5). This is what
+  // makes a Project or Problem ticket readable without opening every child.
+  const TIMELINE_SCOPES = [
+    { key: 'own',      label: 'This ticket',    param: '' },
+    { key: 'children', label: 'Child tickets',  param: '&ischildnotes=true' },
+    { key: 'related',  label: 'Related tickets', param: '&isrelatednotes=true' }
+  ];
+
+  function actionTimestamp(row) {
+    const d = parseHaloDate(row['When']);
+    const t = d ? d.getTime() : NaN;
+    return isNaN(t) ? 0 : t;
+  }
+
   async function openActionTimelinePanel(ticketId = 0) {
     const resolvedTicketId = Number(ticketId) || getCurrentTicketId();
     if (!resolvedTicketId) {
@@ -10527,14 +10593,41 @@ ${orderBy}
     HU.timelineTicketId = resolvedTicketId;
     const drawer = createDrawer('hu-timeline-drawer', 'Action timeline');
     const body = drawer.querySelector('.hu-drawer-body');
-    body.innerHTML = '<div class="hu-row"><span class="hu-row-title">Loading ticket actions...</span></div>';
     openDrawer(drawer);
+    await renderActionTimeline(body, resolvedTicketId);
+    return true;
+  }
+
+  // Fetches every enabled scope in parallel and renders the merged feed.
+  // Re-entrant: the scope chips call it again against the same drawer body, so
+  // toggling a scope refreshes in place instead of reopening the drawer.
+  async function renderActionTimeline(body, resolvedTicketId) {
+    const activeScopes = TIMELINE_SCOPES.filter(s => s.key === 'own' || HU.timelineScope[s.key]);
+    body.innerHTML = '<div class="hu-row"><span class="hu-row-title">Loading ticket actions...</span></div>';
+
+    // Toggling two chips in quick succession leaves two fetches in flight; the
+    // slower one must not paint over the newer result.
+    const renderToken = (HU._timelineRenderSeq = (HU._timelineRenderSeq || 0) + 1);
+    const isStale = () => renderToken !== HU._timelineRenderSeq;
 
     try {
       // /api/actions respects ticket-view permission, so non-admin agents who
       // can see the ticket in Halo's UI can also view its action timeline.
-      const actionsResp = await haloApiRequest(`/api/actions?ticket_id=${resolvedTicketId}&count=200`);
-      const actionRows = extractEntityList(actionsResp, 'actions');
+      const settled = await Promise.all(activeScopes.map(s =>
+        haloApiRequest(`/api/actions?ticket_id=${resolvedTicketId}&count=200${s.param}`)
+          .then(resp => ({ scope: s, resp }))
+          .catch(error => ({ scope: s, error }))
+      ));
+
+      // Failing to read the ticket's own actions is fatal — that's the
+      // permission / bad-id case the catch below explains. Child and related
+      // failures are not: a tenant on an older Halo build may not support the
+      // filters at all, and the ticket's own timeline is still worth showing.
+      if (isStale()) return;
+
+      const ownResult = settled.find(r => r.scope.key === 'own');
+      if (ownResult && ownResult.error) throw ownResult.error;
+      const failedScopes = settled.filter(r => r.error).map(r => r.scope.label);
 
       // Flatten entity-API actions into the same SQL-alias shape the renderer expects.
       const nameish = v => {
@@ -10551,18 +10644,40 @@ ${orderBy}
         if (d.getFullYear() < 2000) return '';
         return v;
       };
-      const rows = actionRows.map(a => ({
-        'Action ID':    a.id,
-        'Outcome':      nameish(a.outcome) || nameish(a.actioncode_name) || nameish(a.who_action_text),
-        'Outcome ID':   a.outcome_id || a.actionoutcome_id || 0,
-        'Note':         nameish(a.note),
-        'Who':          nameish(a.who) || nameish(a.agent_name),
-        'When':         realDate(a.datetime) || realDate(a.actiondatecreated) || realDate(a.actiondate) || realDate(a.who_changed),
-        'Time Taken':   a.timetaken || 0,
-        'Time Taken Adjusted': a.timetaken_adjusted || 0,
-        'Date Emailed': realDate(a.dateemailed),
-        'Hidden':       a.hiddenfromuser ? 1 : 0
-      }));
+
+      const rows = [];
+      const seenActions = new Set();
+      settled.forEach(({ resp, error }) => {
+        if (error) return;
+        extractEntityList(resp, 'actions').forEach(a => {
+          // One ticket can be both a child and a related ticket, so the two
+          // extra scopes can hand back the same action twice.
+          const sourceTicketId = Number(a.ticket_id) || resolvedTicketId;
+          const dedupeKey = `${sourceTicketId}:${a.id}`;
+          if (seenActions.has(dedupeKey)) return;
+          seenActions.add(dedupeKey);
+          rows.push({
+            'Action ID':    a.id,
+            'Outcome':      nameish(a.outcome) || nameish(a.actioncode_name) || nameish(a.who_action_text),
+            'Outcome ID':   a.outcome_id || a.actionoutcome_id || 0,
+            'Note':         nameish(a.note),
+            'Who':          nameish(a.who) || nameish(a.agent_name),
+            'When':         realDate(a.datetime) || realDate(a.actiondatecreated) || realDate(a.actiondate) || realDate(a.who_changed),
+            'Time Taken':   a.timetaken || 0,
+            'Time Taken Adjusted': a.timetaken_adjusted || 0,
+            'Date Emailed': realDate(a.dateemailed),
+            'Hidden':       a.hiddenfromuser ? 1 : 0,
+            'Ticket ID':    sourceTicketId,
+            'Foreign':      sourceTicketId !== resolvedTicketId
+          });
+        });
+      });
+
+      // Halo returns each scope in its own date order; a merged feed has to be
+      // re-sorted or the child actions land in one block at the bottom.
+      rows.sort((a, b) => actionTimestamp(b) - actionTimestamp(a));
+
+      const sourceTicketCount = new Set(rows.map(r => r['Ticket ID'])).size;
 
       body.innerHTML = '';
 
@@ -10572,6 +10687,7 @@ ${orderBy}
       const totalMinutes = rows.reduce((sum, row) => sum + effectiveActionMinutes(row), 0);
       const latestAction = rows[0];
 
+      const mergedScopes = activeScopes.filter(s => s.key !== 'own');
       const header = document.createElement('section');
       header.className = 'hu-card hu-ticket-hero';
       header.innerHTML = `
@@ -10582,6 +10698,7 @@ ${orderBy}
             ${coloredChip(totalActions ? `${totalActions} actions` : 'No actions', 'type')}
             ${coloredChip(emailActions ? `${emailActions} emails` : 'No emails', 'status')}
             ${coloredChip(hiddenActions ? `${hiddenActions} hidden` : 'All visible', hiddenActions ? 'priority' : 'status')}
+            ${mergedScopes.length ? coloredChip(`${sourceTicketCount} ticket${sourceTicketCount === 1 ? '' : 's'}`, 'type') : ''}
           </div>
           <div class="hu-ticket-hero-sub" style="margin-top:8px;color:rgba(255,255,255,0.76);font-size:11px">
             ${escapeHtml(latestAction ? `Latest update ${timeAgo(latestAction['When'])}` : 'No updates returned yet')}
@@ -10589,6 +10706,8 @@ ${orderBy}
         </div>
       `;
       body.appendChild(header);
+
+      body.appendChild(buildTimelineScopeBar(body, resolvedTicketId, failedScopes));
 
       const kpiGrid = document.createElement('div');
       kpiGrid.className = 'hu-360-kpi-grid';
@@ -10640,10 +10759,15 @@ ${orderBy}
       const listWrap = document.createElement('div');
       listWrap.className = 'hu-360-tl';
       rows.forEach((row, index) => listWrap.appendChild(renderActionTimelineFeedRow(row, index === rows.length - 1)));
-      if (!rows.length) listWrap.innerHTML = '<div class="hu-empty-note">No actions returned for this ticket.</div>';
+      if (!rows.length) {
+        listWrap.innerHTML = `<div class="hu-empty-note">${escapeHtml(mergedScopes.length
+          ? 'No actions on this ticket or the scopes you selected.'
+          : 'No actions returned for this ticket.')}</div>`;
+      }
       list.appendChild(listWrap);
       body.appendChild(list);
     } catch (error) {
+      if (isStale()) return;
       const msg = (error && error.message) || String(error || '');
       const isPerm = isReportPermissionError(msg);
       const title = isPerm
@@ -10654,8 +10778,50 @@ ${orderBy}
         : (msg || 'Unknown error.');
       body.innerHTML = '<div class="hu-row"><span class="hu-row-title">' + escapeHtml(title) + '</span><span class="hu-row-sub">' + escapeHtml(detail) + '</span></div>';
     }
+  }
 
-    return true;
+  // Scope chips for the action timeline. "This ticket" is always on and is
+  // rendered as a static chip so the feed's composition is readable at a
+  // glance; the other two toggle, persist, and re-render in place.
+  function buildTimelineScopeBar(body, resolvedTicketId, failedScopes = []) {
+    const wrap = document.createElement('div');
+    wrap.className = 'hu-tl-scope';
+
+    const label = document.createElement('span');
+    label.className = 'hu-tl-scope-label';
+    label.textContent = 'Include';
+    wrap.appendChild(label);
+
+    TIMELINE_SCOPES.forEach(s => {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'hu-audit-chip';
+      chip.textContent = s.label;
+      if (s.key === 'own') {
+        chip.classList.add('is-active', 'is-locked');
+        chip.disabled = true;
+        chip.title = "The ticket's own actions are always included";
+      } else {
+        const on = !!HU.timelineScope[s.key];
+        chip.classList.toggle('is-active', on);
+        chip.setAttribute('aria-pressed', String(on));
+        chip.title = on ? `Stop including ${s.label.toLowerCase()}` : `Also include ${s.label.toLowerCase()}`;
+        chip.addEventListener('click', () => {
+          HU.timelineScope[s.key] = !HU.timelineScope[s.key];
+          saveTimelineScope();
+          renderActionTimeline(body, resolvedTicketId);
+        });
+      }
+      wrap.appendChild(chip);
+    });
+
+    if (failedScopes.length) {
+      const note = document.createElement('div');
+      note.className = 'hu-tl-scope-note';
+      note.textContent = `Could not load: ${failedScopes.join(', ')}. This Halo version may not support that filter.`;
+      wrap.appendChild(note);
+    }
+    return wrap;
   }
 
   function ticket360Section(title, items) {
@@ -10782,6 +10948,14 @@ ${orderBy}
     const timePartMinutes = effectiveActionMinutes(action);
     const timePart = timePartMinutes > 0 ? ` - ${escapeHtml(formatMinutes(timePartMinutes))}` : '';
 
+    // In a merged feed (child / related scopes) every row has to say which
+    // ticket it came from, otherwise the stream is unreadable. Rows from the
+    // ticket you're already on stay unbadged.
+    const sourceTicketId = Number(action['Ticket ID']) || 0;
+    const sourceHtml = action['Foreign'] && sourceTicketId
+      ? `<button type="button" class="hu-tl-source" data-ticket-id="${sourceTicketId}" title="Open ticket #${sourceTicketId}">#${sourceTicketId}</button>`
+      : '';
+
     const row = document.createElement('div');
     row.className = 'hu-360-tl-row';
     row.innerHTML = `
@@ -10790,12 +10964,21 @@ ${orderBy}
         ${!isLast ? '<div class="hu-360-tl-line"></div>' : ''}
       </div>
       <div class="hu-360-tl-body">
-        <div class="hu-360-tl-title">${escapeHtml(action['Outcome'] || `Action ${action['Action ID']}`)}</div>
+        <div class="hu-360-tl-title">${sourceHtml}${escapeHtml(action['Outcome'] || `Action ${action['Action ID']}`)}</div>
         <div class="hu-360-tl-meta">${escapeHtml(action['Who'] || 'Unknown')} - ${escapeHtml(label)} - ${escapeHtml(timeAgo(action['When']))}${timePart}</div>
         <div class="hu-360-tl-meta">${escapeHtml(isHidden ? 'Hidden from user' : 'Visible to user')} - ${escapeHtml(formatDateTime(action['When']))}</div>
         ${noteHtml}
         ${emailHtml}
       </div>`;
+
+    const sourceBtn = row.querySelector('.hu-tl-source');
+    if (sourceBtn) {
+      sourceBtn.addEventListener('click', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        navigateTo(routeDetail('ticket', sourceTicketId));
+      });
+    }
     return row;
   }
 
@@ -13649,6 +13832,7 @@ WHERE COLUMN_NAME LIKE 'CF%'
   loadRecent();
   loadImpersonationState();
   loadSettings();
+  loadTimelineScope();
   loadPaletteSettings();
   loadReviewState();
   loadConfigTree();
